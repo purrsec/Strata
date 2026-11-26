@@ -4711,6 +4711,18 @@ class Service:
         (the server sends it for every request that carries none).  No prompt is counted here: a prompt shortens
         the room at request time, and fit_max_tokens shortens a request to what is left."""
         room = max(0, self.reported_ctx() - CTX_SLACK)
+        # Cap advertised output tokens (default 65536 on >=128K contexts; override via STRATA_MAX_OUTPUT_TOKENS, 0=uncapped)
+        # so clients computing `context - output - headroom` (e.g. DSH compaction) keep full input budget on 1M windows.
+        env_cap = os.environ.get("STRATA_MAX_OUTPUT_TOKENS")
+        if env_cap is not None and env_cap.strip() != "":
+            try:
+                ec = int(env_cap)
+                if ec > 0:
+                    room = min(room, ec)
+            except ValueError:
+                pass
+        elif room > 65536:
+            room = 65536
         shared = self.shared.get("max_tokens")
         if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0:
             room = min(room, shared)
