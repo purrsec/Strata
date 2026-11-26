@@ -216,7 +216,10 @@ public:
                                   + (size_t)strata::ink::kInkVisits * max_slots_ * 3 * strata::ink::kInkSconvCh * 4
                                   + (size_t)8 * max_slots_ * init_glob * per_visit_pos;
         // Include O(1) prefill ws (~114 MiB) + DSpark (~224 MiB when enabled) + activation ws (WDDM floor added inside loader!)
-        const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
+        // Skip DSpark's 460 MiB unembed_screen + 224 MiB pad when DFlash2 is active (frees 684 MiB VRAM on SQ-20.strata!)
+        const char* df2_env_p = std::getenv("STRATA_INK_DFLASH_PACK");
+        const bool want_df2 = opts.enable_dspark && df2_env_p && df2_env_p[0];
+        const bool build_screen = opts.enable_dspark && mf.m.dspark.present && !want_df2;
         const size_t dspark_pad = build_screen ? (224ull << 20) : 0ull;
         const size_t ws_pad = ((max_slots_ >= 8) ? (1280ull << 20)
                              : ((prop.totalGlobalMem >= (20ull << 30)) ? (960ull << 20)
@@ -414,7 +417,8 @@ public:
             snap_active_[slot] = false;
             if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot] = PromptCkpt{};
             if (slot < (int)shared_ckpts_.size()) shared_ckpts_[slot] = PromptCkpt{};
-            if (slot == 0) tree_snap_ready_ = false;
+            if (slot == tree_snap_slot_) tree_snap_ready_ = false;
+            if (slot == dflash2_slot_) { dflash2_slot_ = -1; dflash2_valid_pos_ = -1; }
         }
     }
 
@@ -424,7 +428,9 @@ public:
         snap_active_[slot] = false;
         if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot].valid = false;
         if (slot < (int)shared_ckpts_.size()) shared_ckpts_[slot].valid = false;
-        if (slot == 0) { dspark_slot_ = -1; dflash2_slot_ = -1; dflash2_valid_pos_ = -1; tree_snap_ready_ = false; }
+        if (slot == 0) dspark_slot_ = -1;
+        if (slot == dflash2_slot_) { dflash2_slot_ = -1; dflash2_valid_pos_ = -1; }
+        if (slot == tree_snap_slot_) tree_snap_ready_ = false;
     }
 
     // #6627: Save/restore slot's ShortConv (3.83 MB) + 40 SWA KV ring windows (<=160 MiB in host RAM) + DSpark SWA KV
@@ -581,6 +587,35 @@ public:
                                    (size_t)strata::ink::kInkHidden * sizeof(float), cudaMemcpyDeviceToHost, runner_->st));
             ck.has_dspark = true;
         }
+        // 4. Save DFlash2 SWA-2048 context ring (<= 42 MB in host RAM, <1.5 ms D2H) for multi-turn solo resumption on ANY slot!
+        ck.has_dflash2 = false;
+        if (dflash2_ && dflash2_->ready && dflash2_->mode != strata::ink::Df2Mode::CPU &&
+            dflash2_slot_ == slot && dflash2_valid_pos_ >= seq_len && seq_len > 0) {
+            ck.df2_k.clear(); ck.df2_v.clear();
+            const int cap = strata::ink::InkDFlash2::kRingCap;
+            const int s0 = std::max(0, seq_len - dflash2_->pack.window);
+            const int np = seq_len - s0;
+            const int p0 = s0 % cap;
+            const int seg1 = std::min(np, cap - p0);
+            const int seg2 = np - seg1;
+            const size_t row_b = (size_t)strata::ink::kInkKVDim * sizeof(__half);
+            ck.df2_k.reserve((size_t)dflash2_->pack.layers * np * row_b);
+            ck.df2_v.reserve((size_t)dflash2_->pack.layers * np * row_b);
+            for (int il = 0; il < dflash2_->pack.layers; ++il) {
+                auto copy_df = [&](const __half* src, std::vector<uint8_t>& dst) {
+                    const size_t off = dst.size();
+                    dst.resize(off + (size_t)np * row_b);
+                    const uint8_t* bp = reinterpret_cast<const uint8_t*>(src);
+                    INK_CK(cudaMemcpyAsync(dst.data() + off, bp + (size_t)p0 * row_b, (size_t)seg1 * row_b, cudaMemcpyDeviceToHost, runner_->st));
+                    if (seg2 > 0) {
+                        INK_CK(cudaMemcpyAsync(dst.data() + off + (size_t)seg1 * row_b, bp, (size_t)seg2 * row_b, cudaMemcpyDeviceToHost, runner_->st));
+                    }
+                };
+                copy_df(dflash2_->d_ring_k[il], ck.df2_k);
+                copy_df(dflash2_->d_ring_v[il], ck.df2_v);
+            }
+            ck.has_dflash2 = true;
+        }
         ckpt_sync();
         ck.valid = true;
         return true;
@@ -593,7 +628,7 @@ public:
         const auto& ck = ckpts[slot];
         if (!ck.valid || ck.seq_len != seq_len) return false;
         snap_active_[slot] = false;
-        if (slot == 0) tree_snap_ready_ = false;
+        if (slot == tree_snap_slot_) tree_snap_ready_ = false;
         // 1. Restore ShortConv state
         const size_t sc_elems = (size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh;
         if (model_.ls_active) {
@@ -670,7 +705,37 @@ public:
         } else if (slot == 0) {
             dspark_slot_ = -1;
         }
-        if (slot == 0) { dflash2_slot_ = -1; dflash2_valid_pos_ = -1; }
+        // 4. Restore DFlash2 SWA-2048 context ring if saved (enables instant DFlash2 on multi-turn chats & post-subagent synthesis!)
+        if (ck.has_dflash2 && dflash2_ && dflash2_->ready && dflash2_->mode != strata::ink::Df2Mode::CPU && seq_len > 0) {
+            const int cap = strata::ink::InkDFlash2::kRingCap;
+            const int s0 = std::max(0, seq_len - dflash2_->pack.window);
+            const int np = seq_len - s0;
+            const int p0 = s0 % cap;
+            const int seg1 = std::min(np, cap - p0);
+            const int seg2 = np - seg1;
+            const size_t row_b = (size_t)strata::ink::kInkKVDim * sizeof(__half);
+            size_t dk_o = 0, dv_o = 0;
+            if (ck.df2_k.size() == (size_t)dflash2_->pack.layers * np * row_b &&
+                ck.df2_v.size() == (size_t)dflash2_->pack.layers * np * row_b) {
+                for (int il = 0; il < dflash2_->pack.layers; ++il) {
+                    auto copy_df_h2d = [&](__half* dst, const std::vector<uint8_t>& src, size_t& off) {
+                        uint8_t* bp = reinterpret_cast<uint8_t*>(dst);
+                        INK_CK(cudaMemcpyAsync(bp + (size_t)p0 * row_b, src.data() + off, (size_t)seg1 * row_b, cudaMemcpyHostToDevice, runner_->st));
+                        if (seg2 > 0) {
+                            INK_CK(cudaMemcpyAsync(bp, src.data() + off + (size_t)seg1 * row_b, (size_t)seg2 * row_b, cudaMemcpyHostToDevice, runner_->st));
+                        }
+                        off += (size_t)np * row_b;
+                    };
+                    copy_df_h2d(dflash2_->d_ring_k[il], ck.df2_k, dk_o);
+                    copy_df_h2d(dflash2_->d_ring_v[il], ck.df2_v, dv_o);
+                }
+                dflash2_slot_ = slot;
+                dflash2_valid_pos_ = seq_len;
+            }
+        } else if (slot == dflash2_slot_) {
+            dflash2_slot_ = -1;
+            dflash2_valid_pos_ = -1;
+        }
         ckpt_sync();
         if (runner_->paged_kv_active && seq_len > 0) {
             const int keep_blks = (seq_len + strata::ink::kInkKvBlock - 1) >> strata::ink::kInkKvBlockShift;
@@ -685,7 +750,7 @@ public:
             runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
         snap_active_[slot] = true;
         snap_M_[slot] = 0;
-        if (slot == 0) tree_snap_ready_ = false;
+        if (slot == tree_snap_slot_) tree_snap_ready_ = false;
     }
 
     void rollback_slot(int slot, int keep_len) override {
@@ -702,19 +767,20 @@ public:
                     runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, slot, runner_->max_slots, runner_->tree_cap);
             }
             snap_active_[slot] = false;
-            if (slot == 0 && dflash2_ && dflash2_->ready && dflash2_slot_ == 0) dflash2_valid_pos_ = keep_len;
+            if (dflash2_ && dflash2_->ready && dflash2_slot_ == slot) dflash2_valid_pos_ = keep_len;
             return;
         }
-        if (slot == 0 && tree_snap_ready_) {
+        if (tree_snap_ready_ && slot == tree_snap_slot_) {
             // Exact multi-branch tree rewind on early EOS / stop_tok / anti-loop!
             const int n_keep = std::max(0, std::min(tree_snap_M_, keep_len - tree_snap_p0_));
             strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, false);
+                runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, false);
             if (n_keep > 0) {
                 INK_CK(cudaMemcpyAsync(runner_->d_acc_path, tree_snap_path_, (size_t)n_keep * 4, cudaMemcpyHostToDevice, runner_->st));
                 strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                    runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, 0, runner_->max_slots, runner_->tree_cap);
+                    runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, slot, runner_->max_slots, runner_->tree_cap);
             }
+            if (dflash2_ && dflash2_->ready && dflash2_slot_ == slot) dflash2_valid_pos_ = keep_len;
             tree_snap_ready_ = false;
         }
     }
@@ -970,8 +1036,8 @@ public:
                     runner_->has_img_step = false;
                 }
 
-                const bool df2_on = (dflash2_ && dflash2_->ready && slot == 0);
-                const bool want_taps = (taps_out != nullptr) || (batch.capture_taps && slot == 0 && ((dspark_ && dspark_->ready) || df2_on));
+                const bool df2_on = (dflash2_ && dflash2_->ready);
+                const bool want_taps = (taps_out != nullptr) || (batch.capture_taps && ((slot == 0 && dspark_ && dspark_->ready) || df2_on));
 
                 // If snapshot_slot(slot) is active for DSpark/DFlash2 verify (M <= 16, no images):
                 // run forward_tree_verify (stages ShortConv + KV) & commit all M tokens so rollback_slot can replay exact n_keep!
@@ -1005,8 +1071,9 @@ public:
                     dspark_slot_ = 0;
                 }
                 if (batch.capture_taps && df2_on) {
-                    dflash2_->ingest_taps(p0, M, 0);
-                    dflash2_slot_ = 0;
+                    const int df2_ring_slot = (dflash2_->mode == strata::ink::Df2Mode::CPU) ? slot : 0;
+                    dflash2_->ingest_taps(p0, M, df2_ring_slot);
+                    dflash2_slot_ = slot;
                     dflash2_valid_pos_ = p0 + M;
                 }
                 if (taps_out) {
@@ -1135,21 +1202,22 @@ public:
         int max_draft,
         int32_t* out_draft_ids,
         std::string& /*err*/) override {
-        if (!initialized_ || model_.ls_active || slot != 0) return 0;
-        if (dflash2_ && dflash2_->ready && dflash2_slot_ == 0 && dflash2_valid_pos_ == anchor_pos) {
+        if (!initialized_ || model_.ls_active || slot < 0 || slot >= max_slots_) return 0;
+        if (dflash2_ && dflash2_->ready && dflash2_slot_ == slot && dflash2_valid_pos_ == anchor_pos) {
             if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_) return 0;
             if (!runner_->ensure_global_kv_cap(anchor_pos + 8)) return 0;
-            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
+            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(slot, anchor_pos, anchor_pos + 7)) return 0;
             int32_t ids7[7] = {};
             float conf7[7] = {};
-            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, 0);
+            const int df2_ring_slot = (dflash2_->mode == strata::ink::Df2Mode::CPU) ? slot : 0;
+            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, df2_ring_slot);
             const int cap = std::max(0, std::min(7, max_draft));
             if (cap <= 0) return 0;
             const int best_nd = df2_pick_nd(conf7, cap);
             for (int i = 0; i < best_nd; ++i) out_draft_ids[i] = ids7[i];
             return best_nd;
         }
-        if (!dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
+        if (slot != 0 || !dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
         if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_ || anchor_pos + 8 >= dspark_->max_ctx) return 0;
         if (!runner_->ensure_global_kv_cap(anchor_pos + 8) || !dspark_->ensure_ctx_cap(anchor_pos + 8)) return 0;
         if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
@@ -1185,24 +1253,25 @@ public:
         int32_t* out_emitted,
         int* out_drafted,
         std::string& /*err*/) override {
-        if (!initialized_ || model_.ls_active || slot != 0 || max_emit < 1 || !out_emitted) return 0;
+        if (!initialized_ || model_.ls_active || slot < 0 || slot >= max_slots_ || max_emit < 1 || !out_emitted) return 0;
 
-        // Fast zero-D2H greedy Block-8 verify for InkDFlash2 (supports Paged 1M KV + BF16C + TideCache + Host-KV + FreeKV!)
-        if (dflash2_ && dflash2_->ready && dflash2_slot_ == 0 && dflash2_valid_pos_ == anchor_pos) {
+        // Fast zero-D2H greedy Block-8 verify for InkDFlash2 on ANY active solo slot (supports Paged 1M KV + BF16C + TideCache + Host-KV + FreeKV!)
+        if (dflash2_ && dflash2_->ready && dflash2_slot_ == slot && dflash2_valid_pos_ == anchor_pos) {
             if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_) return 0;
             if (!runner_->ensure_global_kv_cap(anchor_pos + 8)) return 0;
-            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
+            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(slot, anchor_pos, anchor_pos + 7)) return 0;
 
             using Clock = std::chrono::steady_clock;
             const auto t0 = Clock::now();
-            // 1. Snapshot slot-0 ShortConv pre-verify state (2.5 us) for exact mid-block EOS rollback!
+            // 1. Snapshot slot ShortConv pre-verify state (2.5 us) for exact mid-block EOS rollback!
             strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
+                runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
 
             // 2. Draft up to 7 tokens in 1 parallel DFlash2 block pass (HYBRID / GPU / STREAM / CPU)
             int32_t ids7[7] = {};
             float conf7[7] = {};
-            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, 0);
+            const int df2_ring_slot = (dflash2_->mode == strata::ink::Df2Mode::CPU) ? slot : 0;
+            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, df2_ring_slot);
             const auto t1 = Clock::now();
             const int cap = std::max(1, std::min(7, max_emit - 1));
             const int nd = df2_pick_nd(conf7, cap);
@@ -1210,7 +1279,7 @@ public:
             strata::ink::InkTreeSpec tr = strata::ink::make_chain_tree(anchor_tok, ids7, nd);
 
             // 3. Single 48-visit verify (with Paged KV + BF16C + TideCache + Host-KV!) + exact GPU argmax
-            runner_->forward_tree_verify(tr, anchor_pos, 0, true);
+            runner_->forward_tree_verify(tr, anchor_pos, slot, true);
             int32_t target_next[strata::ink::kInkMaxTree] = {};
             runner_->head_argmax_exact(tr.M, target_next);
             const auto t2 = Clock::now();
@@ -1229,21 +1298,22 @@ public:
             // 5. Commit ONLY accepted tokens (ShortConv + Paged/Linear KV + FreeKV summary invalidation) + ingest accepted taps
             INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_emit * 4, cudaMemcpyHostToDevice, runner_->st));
             strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
-                runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_emit, 0, runner_->max_slots, runner_->tree_cap);
+                runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_emit, slot, runner_->max_slots, runner_->tree_cap);
             strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
-                runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, anchor_pos, n_emit, 0, runner_->tree_cap);
-            runner_->paged_invalidate_summaries_pos(0, anchor_pos, n_emit);
+                runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, anchor_pos, n_emit, slot, runner_->tree_cap);
+            runner_->paged_invalidate_summaries_pos(slot, anchor_pos, n_emit);
             for (int t = 0; t < 4; ++t) {
                 strata::ink::k_ink_compact_taps<<<n_emit, 256, 0, runner_->st>>>(
                     runner_->d_taps[t], runner_->d_taps_compact[t], runner_->d_acc_path, n_emit);
             }
             const auto t3 = Clock::now();
-            dflash2_->ingest_taps_from(runner_->d_taps_compact, anchor_pos, n_emit, 0);
+            dflash2_->ingest_taps_from(runner_->d_taps_compact, anchor_pos, n_emit, df2_ring_slot);
             if (spec_cfg_.log) INK_CK(cudaStreamSynchronize(runner_->st));
             const auto t4 = Clock::now();
 
             dflash2_valid_pos_ = anchor_pos + n_emit;
             tree_snap_ready_ = true;
+            tree_snap_slot_ = slot;
             tree_snap_p0_ = anchor_pos;
             tree_snap_M_ = n_emit;
             for (int i = 0; i < n_emit; ++i) tree_snap_path_[i] = path[i];
@@ -1270,7 +1340,7 @@ public:
             return n_emit;
         }
 
-        if (!dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
+        if (slot != 0 || !dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
         if (anchor_pos <= 0 || anchor_pos + 12 >= eff_max_ctx_ || anchor_pos + 12 >= dspark_->max_ctx) return 0;
         if (!runner_->ensure_global_kv_cap(anchor_pos + 12) || !dspark_->ensure_ctx_cap(anchor_pos + 12)) return 0;
         if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 11)) return 0;
@@ -1327,6 +1397,7 @@ public:
             if (st_steps % 200 == 0) std::fprintf(stderr, "[SPEC-STATS] steps=%ld mean_M=%.2f mean_pred_tokens=%.2f mean_actual_tokens=%.2f plain_steps=%ld\n", st_steps, (double)st_nodes / st_steps, st_pred / st_steps, (double)st_emit / st_steps, st_plain);
         }
         tree_snap_ready_ = true;
+        tree_snap_slot_ = 0;
         tree_snap_p0_ = anchor_pos;
         tree_snap_M_ = n_emit;
         for (int i = 0; i < n_emit; ++i) tree_snap_path_[i] = path[i];
@@ -1401,6 +1472,7 @@ private:
     struct PromptCkpt {
         bool valid = false;
         bool has_dspark = false;
+        bool has_dflash2 = false;
         int seq_len = 0;
         int swa_start = 0;
         int swa_len = 0;
@@ -1408,6 +1480,7 @@ private:
         std::vector<uint8_t> swa_k, swa_v, swa_ksc, swa_vsc;
         std::vector<uint8_t> dspark_k, dspark_v;
         std::vector<float> dspark_frnn;
+        std::vector<uint8_t> df2_k, df2_v;
     };
 
     bool initialized_ = false;
@@ -1444,6 +1517,7 @@ private:
     PromptCkpt global_shared_ckpt_;
     std::vector<int32_t> global_shared_blocks_;
     bool tree_snap_ready_ = false;
+    int tree_snap_slot_ = -1;
     int tree_snap_p0_ = 0;
     int tree_snap_M_ = 0;
     int32_t tree_snap_path_[strata::ink::kInkMaxTree] = {};

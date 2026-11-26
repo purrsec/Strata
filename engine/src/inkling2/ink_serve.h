@@ -1072,7 +1072,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 continue;
             }
             batch.push(s, rq.cur_pos, rq.next_tok, true);
-            if (use_dspark && swa_only_draft && s == 0) batch.capture_taps = true;
+            if (use_dspark && swa_only_draft && n_active == 1) batch.capture_taps = true;
             logit_slots.push_back(s);
             --token_budget;
         }
@@ -1120,7 +1120,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     batch.push(chosen, p_i, rq.prompt_ids[p_i], is_last, img_idx);
                     if (is_last) logit_slots.push_back(chosen);
                 }
-                if (use_dspark && swa_only_draft && chosen == 0 && (rq.prefill_pos + take > rq.prompt_len - 2064)) {
+                if (use_dspark && swa_only_draft && n_active == 1 && (rq.prefill_pos + take > rq.prompt_len - 2064)) {
                     batch.capture_taps = true;
                 }
                 prefill_fed[chosen] = take;
