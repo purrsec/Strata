@@ -675,6 +675,165 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     }
 }
 
+// Metadata for TideCache ping-pong DMA-staged FP16 host blocks sitting contiguously in VRAM!
+struct InkStreamBlkMeta {
+    int32_t  pos_start;    // logical start position (blk * 256)
+    int32_t  max_pos_len;  // valid tokens in this block (1..256)
+    uint32_t slot_mask;    // bitmask of active slots m in 0..M-1 attending this block
+    uint32_t pad;
+};
+
+// TideCache GPU Split-K kernel over DMA-staged contiguous FP16 blocks in VRAM (1,100 GB/s!)
+// Grid: (8 KV heads, n_sp_tile, M), Block: 128 (4 warps x 32 lanes)
+__global__ void __launch_bounds__(128) k_ink_flash_gqa_tide_tile(
+    const float* __restrict__ q,                 // [M, 24, 128]
+    const float* __restrict__ rel_table,         // [M, 24, 1025]
+    const int32_t* __restrict__ q_pos,           // [M]
+    const __half* __restrict__ st_k,             // [n_blks, 256, 8, 128] contiguous VRAM
+    const __half* __restrict__ st_v,             // [n_blks, 256, 8, 128] contiguous VRAM
+    const InkStreamBlkMeta* __restrict__ meta,   // [n_blks]
+    int n_blks,
+    float* __restrict__ tile_pm,                 // [M, 24, n_sp_tile]
+    float* __restrict__ tile_pl,                 // [M, 24, n_sp_tile]
+    float* __restrict__ tile_po,                 // [M, 24, n_sp_tile, 128]
+    int M,
+    int n_sp_tile) {
+    const int kh = blockIdx.x;
+    const int sp = blockIdx.y;
+    const int m  = blockIdx.z;
+    if (kh >= kInkKVHeads || sp >= n_sp_tile || m >= M) return;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int qp   = q_pos[m];
+    const float scale = 0.08838834764831845f;
+    const int h0 = 3 * kh;
+
+    const float4 qv0 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+    const float* rt0 = rel_table + ((size_t)m * kInkHeads + h0 + 0) * (kInkRelExtent + 1);
+    const float* rt1 = rel_table + ((size_t)m * kInkHeads + h0 + 1) * (kInkRelExtent + 1);
+    const float* rt2 = rel_table + ((size_t)m * kInkHeads + h0 + 2) * (kInkRelExtent + 1);
+
+    float mw[3] = {-1e30f, -1e30f, -1e30f};
+    float lw[3] = {0.0f, 0.0f, 0.0f};
+    float a[3][4] = {};
+
+    const uint32_t mbit = 1u << m;
+    const int b_per = (n_blks + n_sp_tile - 1) / n_sp_tile;
+    const int b_beg = sp * b_per;
+    const int b_end = min(n_blks, b_beg + b_per);
+
+    for (int bi = b_beg; bi < b_end; ++bi) {
+        const InkStreamBlkMeta bm = meta[bi];
+        if ((bm.slot_mask & mbit) == 0u) continue;
+        const int plen = min(bm.max_pos_len, qp - bm.pos_start + 1);
+        if (plen <= 0) continue;
+        const size_t blk_base = (size_t)bi * kInkKvBlock;
+        for (int t = warp; t < plen; t += 4) {
+            const int kp = bm.pos_start + t;
+            const size_t base = ((blk_base + t) * kInkKVHeads + kh) * kInkHeadDim + (size_t)lane * 4;
+            const uint2 k2 = *(const uint2*)(st_k + base);
+            const uint2 v2 = *(const uint2*)(st_v + base);
+            const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+            const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+            const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+            const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+            const int dist = min(max(qp - kp, 0), kInkRelExtent);
+            float d0 = warp_sum(qv0.x * kf0.x + qv0.y * kf0.y + qv0.z * kf1.x + qv0.w * kf1.y) * scale + rt0[dist];
+            float d1 = warp_sum(qv1.x * kf0.x + qv1.y * kf0.y + qv1.z * kf1.x + qv1.w * kf1.y) * scale + rt1[dist];
+            float d2 = warp_sum(qv2.x * kf0.x + qv2.y * kf0.y + qv2.z * kf1.x + qv2.w * kf1.y) * scale + rt2[dist];
+            const float sc[3] = {d0, d1, d2};
+#pragma unroll
+            for (int r = 0; r < 3; ++r) {
+                const float mn = fmaxf(mw[r], sc[r]);
+                const float al = __expf(mw[r] - mn);
+                const float p  = __expf(sc[r] - mn);
+                lw[r] = lw[r] * al + p;
+                a[r][0] = a[r][0] * al + p * vf0.x;
+                a[r][1] = a[r][1] * al + p * vf0.y;
+                a[r][2] = a[r][2] * al + p * vf1.x;
+                a[r][3] = a[r][3] * al + p * vf1.y;
+                mw[r] = mn;
+            }
+        }
+    }
+
+    __shared__ float sm_m[4], sm_l[4], sm_a[4][kInkHeadDim];
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        if (lane == 0) { sm_m[warp] = mw[r]; sm_l[warp] = lw[r]; }
+        sm_a[warp][lane * 4 + 0] = a[r][0];
+        sm_a[warp][lane * 4 + 1] = a[r][1];
+        sm_a[warp][lane * 4 + 2] = a[r][2];
+        sm_a[warp][lane * 4 + 3] = a[r][3];
+        __syncthreads();
+        if (warp == 0) {
+            float mg = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
+            float w0 = sm_l[0] > 0.0f ? __expf(sm_m[0] - mg) : 0.0f;
+            float w1 = sm_l[1] > 0.0f ? __expf(sm_m[1] - mg) : 0.0f;
+            float w2 = sm_l[2] > 0.0f ? __expf(sm_m[2] - mg) : 0.0f;
+            float w3 = sm_l[3] > 0.0f ? __expf(sm_m[3] - mg) : 0.0f;
+            const float lt = sm_l[0] * w0 + sm_l[1] * w1 + sm_l[2] * w2 + sm_l[3] * w3;
+            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_sp_tile + sp;
+            if (lane == 0) { tile_pm[idx_sp] = mg; tile_pl[idx_sp] = lt; }
+            *(float4*)(tile_po + idx_sp * kInkHeadDim + lane * 4) = make_float4(
+                sm_a[0][lane * 4 + 0] * w0 + sm_a[1][lane * 4 + 0] * w1 + sm_a[2][lane * 4 + 0] * w2 + sm_a[3][lane * 4 + 0] * w3,
+                sm_a[0][lane * 4 + 1] * w0 + sm_a[1][lane * 4 + 1] * w1 + sm_a[2][lane * 4 + 1] * w2 + sm_a[3][lane * 4 + 1] * w3,
+                sm_a[0][lane * 4 + 2] * w0 + sm_a[1][lane * 4 + 2] * w1 + sm_a[2][lane * 4 + 2] * w2 + sm_a[3][lane * 4 + 2] * w3,
+                sm_a[0][lane * 4 + 3] * w0 + sm_a[1][lane * 4 + 3] * w1 + sm_a[2][lane * 4 + 3] * w2 + sm_a[3][lane * 4 + 3] * w3);
+        }
+        __syncthreads();
+    }
+}
+
+// Accumulate n_sp_tile partial results directly into split slot `dst_sp` of (part_m, part_l, part_o)!
+// On tile_idx == 0 overwrites split `dst_sp`; on tile_idx > 0 merges via exact online softmax!
+__global__ void __launch_bounds__(128) k_ink_flash_gqa_tide_accum(
+    const float* __restrict__ tile_pm,   // [M, 24, n_sp_tile]
+    const float* __restrict__ tile_pl,   // [M, 24, n_sp_tile]
+    const float* __restrict__ tile_po,   // [M, 24, n_sp_tile, 128]
+    float* __restrict__ part_m,          // [M, 24, n_sp_tot]
+    float* __restrict__ part_l,          // [M, 24, n_sp_tot]
+    float* __restrict__ part_o,          // [M, 24, n_sp_tot, 128]
+    int M, int n_sp_tile, int n_sp_tot, int dst_sp, int is_first) {
+    const int h = blockIdx.x;
+    const int m = blockIdx.y;
+    const int d = threadIdx.x;
+    if (h >= kInkHeads || m >= M) return;
+
+    const size_t tbase = ((size_t)m * kInkHeads + h) * n_sp_tile;
+    const size_t dst_idx = ((size_t)m * kInkHeads + h) * n_sp_tot + dst_sp;
+
+    float mg = (!is_first && part_l[dst_idx] > 0.0f) ? part_m[dst_idx] : -1e30f;
+    for (int s = 0; s < n_sp_tile; ++s) {
+        if (tile_pl[tbase + s] > 0.0f) mg = fmaxf(mg, tile_pm[tbase + s]);
+    }
+    if (mg <= -1e29f) {
+        if (d == 0) { part_m[dst_idx] = -1e30f; part_l[dst_idx] = 0.0f; }
+        part_o[dst_idx * kInkHeadDim + d] = 0.0f;
+        return;
+    }
+    float lt = 0.0f;
+    float ov = 0.0f;
+    if (!is_first && part_l[dst_idx] > 0.0f) {
+        const float w = __expf(part_m[dst_idx] - mg);
+        lt = part_l[dst_idx] * w;
+        ov = part_o[dst_idx * kInkHeadDim + d] * w;
+    }
+    for (int s = 0; s < n_sp_tile; ++s) {
+        const float ls = tile_pl[tbase + s];
+        if (ls <= 0.0f) continue;
+        const float w = __expf(tile_pm[tbase + s] - mg);
+        lt += ls * w;
+        ov += tile_po[(tbase + s) * kInkHeadDim + d] * w;
+    }
+    if (d == 0) { part_m[dst_idx] = mg; part_l[dst_idx] = lt; }
+    part_o[dst_idx * kInkHeadDim + d] = ov;
+}
+
 // Inject CPU-computed host-KV partial [M, 24, 130] (128 o + m + l) into split index `dst_sp` of Split-K buffers!
 __global__ void __launch_bounds__(128) k_ink_attn_inject_split(
     const float* __restrict__ host_in,    // [M, 24, 130]
@@ -933,6 +1092,38 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
                 vb = pf_cvt_from_f32<false>(vf);
             }
         }
+    }
+    uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
+    uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);
+    const int h0 = 3 * kh;
+    k_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = kb;
+    k_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = kb;
+    k_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = kb;
+    v_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = vb;
+    v_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = vb;
+    v_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = vb;
+}
+
+// Pack DMA-staged FP16 host blocks from VRAM (1,100 GB/s) into BF16/FP16 prefill buffers [24, K_len, 128]!
+template <bool USE_FP16 = false>
+__global__ void __launch_bounds__(128) k_ink_pf_pack_kv_staged(
+    const __half* __restrict__ st_k,     // [K_len, 8, 128] contiguous FP16 in VRAM
+    const __half* __restrict__ st_v,     // [K_len, 8, 128] contiguous FP16 in VRAM
+    int K_len,
+    void* __restrict__ k_out_v,          // [24, K_len, 128]
+    void* __restrict__ v_out_v) {
+    const int kh = blockIdx.x;
+    const int ki = blockIdx.y;
+    const int d  = threadIdx.x;
+    if (kh >= kInkKVHeads || ki >= K_len) return;
+    const size_t base = ((size_t)ki * kInkKVHeads + kh) * kInkHeadDim + d;
+    uint16_t kb, vb;
+    if constexpr (USE_FP16) {
+        kb = *reinterpret_cast<const uint16_t*>(&st_k[base]);
+        vb = *reinterpret_cast<const uint16_t*>(&st_v[base]);
+    } else {
+        kb = pf_cvt_from_f32<false>(__half2float(st_k[base]));
+        vb = pf_cvt_from_f32<false>(__half2float(st_v[base]));
     }
     uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
     uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);

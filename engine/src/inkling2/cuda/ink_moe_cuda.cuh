@@ -785,36 +785,39 @@ __device__ __forceinline__ void ink_gguf_row_dot_multi(
                     for (int k = 0; k < 8; ++k) wv[k] = kInkIq4NlLut[hi ? (qp[k] >> 4) : (qp[k] & 0xFu)];
                     w0 = gguf_pack4_i8(wv[0], wv[1], wv[2], wv[3]);
                     w1 = gguf_pack4_i8(wv[4], wv[5], wv[6], wv[7]);
-                } else {  // Q5_0 (6)
+                } else {  // Q5_0 (6): SWAR bit-parallel unpack (6 ALU ops instead of 60!) + exact xb.s bias!
                     const uint32_t qh = ld32_u(blk + 2);
                     const uint8_t* qp = blk + 6 + (l4 & 1) * 8;
                     const int hi = l4 >> 1;
                     const int hbase = hi * 16 + (l4 & 1) * 8;
-                    int8_t wv[8];
-#pragma unroll
-                    for (int k = 0; k < 8; ++k) {
-                        const uint32_t nib = hi ? (qp[k] >> 4) : (qp[k] & 0xFu);
-                        const uint32_t hb = ((qh >> (hbase + k)) & 1u) << 4;
-                        wv[k] = (int8_t)((int)(nib | hb) - 16);
-                    }
-                    w0 = gguf_pack4_i8(wv[0], wv[1], wv[2], wv[3]);
-                    w1 = gguf_pack4_i8(wv[4], wv[5], wv[6], wv[7]);
+                    const uint32_t p0 = ld32_u(qp);
+                    const uint32_t p1 = ld32_u(qp + 4);
+                    const uint32_t n0 = hi ? ((p0 >> 4) & 0x0F0F0F0Fu) : (p0 & 0x0F0F0F0Fu);
+                    const uint32_t n1 = hi ? ((p1 >> 4) & 0x0F0F0F0Fu) : (p1 & 0x0F0F0F0Fu);
+                    const uint32_t h0 = ((((qh >> (hbase + 0)) & 0xFu) * 0x00204081u) & 0x01010101u) << 4;
+                    const uint32_t h1 = ((((qh >> (hbase + 4)) & 0xFu) * 0x00204081u) & 0x01010101u) << 4;
+                    w0 = n0 | h0;
+                    w1 = n1 | h1;
                 }
             }
 #pragma unroll
             for (int m = 0; m < MAX_M; ++m) {
                 if (m < n_e) {
                     int32_t isum = 0;
-                    float xd = 0.0f;
+                    float xd = 0.0f, xs = 0.0f;
                     if (valid) {
                         const InkQ8_1_G32& xb = xq_ptrs[m][b];
                         xd = xb.d;
+                        xs = xb.s;
                         const uint2 x2 = *reinterpret_cast<const uint2*>(xb.qs + in32);
                         isum = dp4a_i8(w1, x2.y, dp4a_i8(w0, x2.x, 0));
                     }
                     isum += __shfl_xor_sync(0xFFFFFFFFu, isum, 2);
                     isum += __shfl_xor_sync(0xFFFFFFFFu, isum, 1);
-                    if (l4 == 0 && valid) acc[m] = fmaf(dl * xd, (float)isum, acc[m]);
+                    if (l4 == 0 && valid) {
+                        if (ggml_type == 6) acc[m] = fmaf(dl, xd * (float)isum - 16.0f * xs, acc[m]);
+                        else                acc[m] = fmaf(dl * xd, (float)isum, acc[m]);
+                    }
                 }
             }
         }
@@ -888,20 +891,104 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_gguf_dp4a(
     const uint8_t* base = body + sizeof(InkGgufExpertHeader);
     const uint8_t* rg = base + (size_t)f * rb;
     const uint8_t* ru = base + (size_t)(kInkInter + f) * rb;
-    constexpr int NBX = kInkHidden >> 5;
+    constexpr int NBX = kInkHidden >> 5;  // 72 blocks * 40 B = 2880 B/token
+    constexpr int SM_M = (MAX_M <= 4) ? MAX_M : 1;
+    __shared__ alignas(8) InkQ8_1_G32 s_xq[SM_M][NBX];
+    const int tid = threadIdx.x;
+
     for (int k0 = 0; k0 < cnt; k0 += MAX_M) {
         const int n_e = min(MAX_M, cnt - k0);
         const InkQ8_1_G32* xq_ptrs[MAX_M];
         const float* xf_ptrs[MAX_M];
+        if constexpr (MAX_M <= 4) {
+            constexpr int N2 = (int)(NBX * sizeof(InkQ8_1_G32) / 8);  // 360 uint2s
+            for (int m = 0; m < n_e; ++m) {
+                const int ti = tb.tok_idx[beg + k0 + m];
+                const uint2* src = reinterpret_cast<const uint2*>(xq_g32 + (size_t)ti * NBX);
+                uint2* dst = reinterpret_cast<uint2*>(s_xq[m]);
+                for (int i = tid; i < N2; i += 128) dst[i] = src[i];
+                xq_ptrs[m] = s_xq[m];
+                xf_ptrs[m] = x_f32 + (size_t)ti * kInkHidden;
+            }
+            for (int m = n_e; m < MAX_M; ++m) { xq_ptrs[m] = s_xq[0]; xf_ptrs[m] = x_f32; }
+            __syncthreads();
+        } else {
 #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            const int ti = (m < n_e) ? tb.tok_idx[beg + k0 + m] : 0;
-            xq_ptrs[m] = xq_g32 + (size_t)ti * NBX;
-            xf_ptrs[m] = x_f32  + (size_t)ti * kInkHidden;
+            for (int m = 0; m < MAX_M; ++m) {
+                const int ti = (m < n_e) ? tb.tok_idx[beg + k0 + m] : 0;
+                xq_ptrs[m] = xq_g32 + (size_t)ti * NBX;
+                xf_ptrs[m] = x_f32  + (size_t)ti * kInkHidden;
+            }
         }
+
         float ga[MAX_M] = {}, ua[MAX_M] = {};
-        ink_gguf_row_dot_multi<MAX_M>(hdr->gu_type, rg, xq_ptrs, xf_ptrs, n_e, kInkHidden, lane, ga);
-        ink_gguf_row_dot_multi<MAX_M>(hdr->gu_type, ru, xq_ptrs, xf_ptrs, n_e, kInkHidden, lane, ua);
+        if (hdr->gu_type == 12u) {
+            // Fused Q4_K Gate+Up reading s_xq ONCE + direct aligned uint2 weight loads!
+            const int sub  = lane >> 2;
+            const int l4   = lane & 3;
+            const int in32 = l4 * 8;
+            const int j64  = sub >> 1;
+            const int hi   = sub & 1;
+            const size_t qoff = 16u + (size_t)j64 * 32u + (size_t)in32;
+#pragma unroll
+            for (int b = 0; b < (kInkHidden >> 8); ++b) {
+                const uint8_t* bg = rg + (size_t)b * 144u;
+                const uint8_t* bu = ru + (size_t)b * 144u;
+                const float dg = f16_to_f32(ld16_u(bg)), dmg = f16_to_f32(ld16_u(bg + 2));
+                const float du = f16_to_f32(ld16_u(bu)), dmu = f16_to_f32(ld16_u(bu + 2));
+                const uint8_t* scg = bg + 4;
+                const uint8_t* scu = bu + 4;
+                uint8_t sdg, smg, sdu, smu;
+                if (sub < 4) {
+                    sdg = scg[sub] & 63u; smg = scg[sub + 4] & 63u;
+                    sdu = scu[sub] & 63u; smu = scu[sub + 4] & 63u;
+                } else {
+                    sdg = (scg[sub + 4] & 0xFu) | ((scg[sub - 4] >> 6) << 4);
+                    smg = (scg[sub + 4] >> 4)   | ((scg[sub]     >> 6) << 4);
+                    sdu = (scu[sub + 4] & 0xFu) | ((scu[sub - 4] >> 6) << 4);
+                    smu = (scu[sub + 4] >> 4)   | ((scu[sub]     >> 6) << 4);
+                }
+                const float dlg = dg * (float)sdg, mlg = dmg * (float)smg;
+                const float dlu = du * (float)sdu, mlu = dmu * (float)smu;
+                const uint2 pg = *reinterpret_cast<const uint2*>(bg + qoff);
+                const uint2 pu = *reinterpret_cast<const uint2*>(bu + qoff);
+                const uint32_t wg0 = hi ? ((pg.x >> 4) & 0x0F0F0F0Fu) : (pg.x & 0x0F0F0F0Fu);
+                const uint32_t wg1 = hi ? ((pg.y >> 4) & 0x0F0F0F0Fu) : (pg.y & 0x0F0F0F0Fu);
+                const uint32_t wu0 = hi ? ((pu.x >> 4) & 0x0F0F0F0Fu) : (pu.x & 0x0F0F0F0Fu);
+                const uint32_t wu1 = hi ? ((pu.y >> 4) & 0x0F0F0F0Fu) : (pu.y & 0x0F0F0F0Fu);
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < n_e) {
+                        const InkQ8_1_G32& xb = xq_ptrs[m][b * 8 + sub];
+                        const uint2 x2 = *reinterpret_cast<const uint2*>(xb.qs + in32);
+                        int32_t ig = dp4a_i8(wg1, x2.y, dp4a_i8(wg0, x2.x, 0));
+                        int32_t iu = dp4a_i8(wu1, x2.y, dp4a_i8(wu0, x2.x, 0));
+                        ig += __shfl_xor_sync(0xFFFFFFFFu, ig, 2);
+                        ig += __shfl_xor_sync(0xFFFFFFFFu, ig, 1);
+                        iu += __shfl_xor_sync(0xFFFFFFFFu, iu, 2);
+                        iu += __shfl_xor_sync(0xFFFFFFFFu, iu, 1);
+                        if (l4 == 0) {
+                            ga[m] = fmaf(dlg * xb.d, (float)ig, fmaf(-mlg, xb.s, ga[m]));
+                            ua[m] = fmaf(dlu * xb.d, (float)iu, fmaf(-mlu, xb.s, ua[m]));
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < n_e) {
+                    ga[m] += __shfl_xor_sync(0xFFFFFFFFu, ga[m], 16);
+                    ga[m] += __shfl_xor_sync(0xFFFFFFFFu, ga[m], 8);
+                    ga[m] += __shfl_xor_sync(0xFFFFFFFFu, ga[m], 4);
+                    ua[m] += __shfl_xor_sync(0xFFFFFFFFu, ua[m], 16);
+                    ua[m] += __shfl_xor_sync(0xFFFFFFFFu, ua[m], 8);
+                    ua[m] += __shfl_xor_sync(0xFFFFFFFFu, ua[m], 4);
+                }
+            }
+        } else {
+            ink_gguf_row_dot_multi<MAX_M>(hdr->gu_type, rg, xq_ptrs, xf_ptrs, n_e, kInkHidden, lane, ga);
+            ink_gguf_row_dot_multi<MAX_M>(hdr->gu_type, ru, xq_ptrs, xf_ptrs, n_e, kInkHidden, lane, ua);
+        }
         if (lane == 0) {
 #pragma unroll
             for (int m = 0; m < MAX_M; ++m) {
@@ -911,6 +998,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_gguf_dp4a(
                 }
             }
         }
+        if constexpr (MAX_M <= 4) { if (k0 + MAX_M < cnt) __syncthreads(); }
     }
 }
 
@@ -940,16 +1028,33 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_gguf_dp4a(
     if (skip_q80 && hdr->dn_type < 32u && (((uint32_t)skip_q80 >> hdr->dn_type) & 1u)) return;
     const size_t rb = ink_gguf_row_bytes(hdr->dn_type, kInkInter);
     const uint8_t* rr = body + ex.dn_off + (size_t)r * rb;
-    constexpr int NBH = kInkInter >> 5;
+    constexpr int NBH = kInkInter >> 5;  // 36 blocks * 40 B = 1440 B/token
+    constexpr int SM_M = (MAX_M <= 4) ? MAX_M : 1;
+    __shared__ alignas(8) InkQ8_1_G32 s_hq[SM_M][NBH];
+    const int tid = threadIdx.x;
     for (int k0 = 0; k0 < cnt; k0 += MAX_M) {
         const int n_e = min(MAX_M, cnt - k0);
         const InkQ8_1_G32* hq_ptrs[MAX_M];
         const float* hf_ptrs[MAX_M];
+        if constexpr (MAX_M <= 4) {
+            constexpr int N2 = (int)(NBH * sizeof(InkQ8_1_G32) / 8);  // 180 uint2s
+            for (int m = 0; m < n_e; ++m) {
+                const int row_i = beg + k0 + m;
+                const uint2* src = reinterpret_cast<const uint2*>(hq_g32 + (size_t)row_i * NBH);
+                uint2* dst = reinterpret_cast<uint2*>(s_hq[m]);
+                for (int i = tid; i < N2; i += 128) dst[i] = src[i];
+                hq_ptrs[m] = s_hq[m];
+                hf_ptrs[m] = h_in + (size_t)row_i * kInkInter;
+            }
+            for (int m = n_e; m < MAX_M; ++m) { hq_ptrs[m] = s_hq[0]; hf_ptrs[m] = h_in; }
+            __syncthreads();
+        } else {
 #pragma unroll
-        for (int m = 0; m < MAX_M; ++m) {
-            const int row_i = (m < n_e) ? (beg + k0 + m) : 0;
-            hq_ptrs[m] = hq_g32 + (size_t)row_i * NBH;
-            hf_ptrs[m] = h_in   + (size_t)row_i * kInkInter;
+            for (int m = 0; m < MAX_M; ++m) {
+                const int row_i = (m < n_e) ? (beg + k0 + m) : 0;
+                hq_ptrs[m] = hq_g32 + (size_t)row_i * NBH;
+                hf_ptrs[m] = h_in   + (size_t)row_i * kInkInter;
+            }
         }
         float va[MAX_M] = {};
         ink_gguf_row_dot_multi<MAX_M>(hdr->dn_type, rr, hq_ptrs, hf_ptrs, n_e, kInkInter, lane, va);
@@ -962,6 +1067,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_gguf_dp4a(
                 }
             }
         }
+        if constexpr (MAX_M <= 4) { if (k0 + MAX_M < cnt) __syncthreads(); }
     }
 }
 

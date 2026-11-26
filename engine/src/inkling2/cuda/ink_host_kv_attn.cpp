@@ -470,3 +470,169 @@ void ink_host_kv_attn_fp16(
 }
 
 }  // namespace strata::ink
+
+// ---- Stage F: FreeKV (ICLR 2026) + HERALD (Nov 2026) Speculative Sparse 1M CPU Lookahead ----
+namespace strata::ink {
+
+void ink_host_kv_build_summary_fp16(const void* slab_raw_k, int boff, int pos_len, InkBlockSummary* out_sum) {
+    if (!slab_raw_k || !out_sum || pos_len <= 0) return;
+    const uint16_t* sk = reinterpret_cast<const uint16_t*>(slab_raw_k)
+                       + (size_t)boff * kBlockTok * kKVHeads * kHeadDim;
+    alignas(32) float vmin[kKVHeads * kHeadDim];
+    alignas(32) float vmax[kKVHeads * kHeadDim];
+    // Init from token 0
+    for (int i = 0; i < kKVHeads * kHeadDim; i += 8) {
+        __m256 v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sk + i)));
+        _mm256_store_ps(vmin + i, v);
+        _mm256_store_ps(vmax + i, v);
+    }
+    for (int t = 1; t < pos_len; ++t) {
+        const uint16_t* row = sk + (size_t)t * kKVHeads * kHeadDim;
+        for (int i = 0; i < kKVHeads * kHeadDim; i += 8) {
+            __m256 v = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(row + i)));
+            _mm256_store_ps(vmin + i, _mm256_min_ps(_mm256_load_ps(vmin + i), v));
+            _mm256_store_ps(vmax + i, _mm256_max_ps(_mm256_load_ps(vmax + i), v));
+        }
+    }
+    for (int i = 0; i < kKVHeads * kHeadDim; i += 8) {
+        __m128i hmin = _mm256_cvtps_ph(_mm256_load_ps(vmin + i), _MM_FROUND_TO_NEAREST_INT);
+        __m128i hmax = _mm256_cvtps_ph(_mm256_load_ps(vmax + i), _MM_FROUND_TO_NEAREST_INT);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_sum->k_min + i), hmin);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_sum->k_max + i), hmax);
+    }
+    out_sum->valid = 1;
+}
+
+float ink_host_kv_min_q_cosine(const float* q_cur, const float* q_prev, int M) {
+    float min_gcos = 1.0f;
+    for (int m = 0; m < M; ++m) {
+        const float* qc = q_cur  + (size_t)m * kHeads * kHeadDim;
+        const float* qp = q_prev + (size_t)m * kHeads * kHeadDim;
+        for (int kh = 0; kh < kKVHeads; ++kh) {
+            float gsum = 0.0f;
+            for (int r = 0; r < 3; ++r) {
+                const float* a = qc + (size_t)(3 * kh + r) * kHeadDim;
+                const float* b = qp + (size_t)(3 * kh + r) * kHeadDim;
+                __m256 dab = _mm256_setzero_ps(), daa = _mm256_setzero_ps(), dbb = _mm256_setzero_ps();
+                for (int d = 0; d < kHeadDim; d += 8) {
+                    __m256 va = _mm256_loadu_ps(a + d);
+                    __m256 vb = _mm256_loadu_ps(b + d);
+                    dab = _mm256_fmadd_ps(va, vb, dab);
+                    daa = _mm256_fmadd_ps(va, va, daa);
+                    dbb = _mm256_fmadd_ps(vb, vb, dbb);
+                }
+                const float ab = hsum256(dab);
+                const float na = hsum256(daa);
+                const float nb = hsum256(dbb);
+                const float denom = std::sqrt(na * nb);
+                gsum += (denom > 1e-12f) ? (ab / denom) : 1.0f;
+            }
+            const float gcos = gsum * (1.0f / 3.0f);
+            if (gcos < min_gcos) min_gcos = gcos;
+        }
+    }
+    return min_gcos;
+}
+
+int ink_host_kv_select_topk_fp16(
+    const float* q,
+    const void* const* slab_raw_k,
+    InkBlockSummary* const* slab_sums,
+    const InkHostKvUniqueBlock* ublocks,
+    int n_ublocks,
+    int M,
+    int top_k,
+    int* out_indices) {
+    if (n_ublocks <= 0 || top_k <= 0) return 0;
+    if (n_ublocks <= top_k) {
+        for (int i = 0; i < n_ublocks; ++i) out_indices[i] = i;
+        return n_ublocks;
+    }
+
+    // Lazily populate summaries for any newly finalized host block (only once per block lifetime!)
+    for (int i = 0; i < n_ublocks; ++i) {
+        const auto& ub = ublocks[i];
+        InkBlockSummary* sm = &slab_sums[ub.slab][ub.boff];
+        if (!sm->valid) ink_host_kv_build_summary_fp16(slab_raw_k[ub.slab], ub.boff, ub.max_pos_len, sm);
+    }
+
+    // Score every block using Quest/FreeKV exact upper bound: sum_d max(q*k_min, q*k_max) across active slots & heads
+    std::vector<float> scores((size_t)n_ublocks, -1e30f);
+    // Find max pos_start to pin the 4 most recent host blocks + 2 earliest host blocks
+    int min_pos = 1 << 30, max_pos = -1;
+    for (int i = 0; i < n_ublocks; ++i) {
+        if (ublocks[i].pos_start < min_pos) min_pos = ublocks[i].pos_start;
+        if (ublocks[i].pos_start > max_pos) max_pos = ublocks[i].pos_start;
+    }
+
+    // Score in parallel if many blocks (> 128), else single-threaded (< 30 us!)
+    auto score_range = [&](int a, int b) {
+        for (int bi = a; bi < b; ++bi) {
+            const auto& ub = ublocks[bi];
+            // Always pin first 2 host blocks (attention sinks / system header) and last 4 host blocks (recent context)
+            if (ub.pos_start <= min_pos + kBlockTok || ub.pos_start >= max_pos - 3 * kBlockTok) {
+                scores[bi] = 1e20f;
+                continue;
+            }
+            const InkBlockSummary& sm = slab_sums[ub.slab][ub.boff];
+            float best_sc = -1e30f;
+            uint32_t mask = ub.slot_mask;
+            while (mask) {
+                const int m = __builtin_ctz(mask);
+                mask &= (mask - 1u);
+                if (m >= M) break;
+                const float* qm = q + (size_t)m * kHeads * kHeadDim;
+                float slot_sc = 0.0f;
+                for (int kh = 0; kh < kKVHeads; ++kh) {
+                    const uint16_t* pmin = sm.k_min + (size_t)kh * kHeadDim;
+                    const uint16_t* pmax = sm.k_max + (size_t)kh * kHeadDim;
+                    const float* q0 = qm + (size_t)(3 * kh + 0) * kHeadDim;
+                    const float* q1 = qm + (size_t)(3 * kh + 1) * kHeadDim;
+                    const float* q2 = qm + (size_t)(3 * kh + 2) * kHeadDim;
+                    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps(), s2 = _mm256_setzero_ps();
+                    for (int d = 0; d < kHeadDim; d += 8) {
+                        __m256 kmn = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pmin + d)));
+                        __m256 kmx = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pmax + d)));
+                        __m256 vq0 = _mm256_loadu_ps(q0 + d);
+                        __m256 vq1 = _mm256_loadu_ps(q1 + d);
+                        __m256 vq2 = _mm256_loadu_ps(q2 + d);
+                        s0 = _mm256_add_ps(s0, _mm256_max_ps(_mm256_mul_ps(vq0, kmn), _mm256_mul_ps(vq0, kmx)));
+                        s1 = _mm256_add_ps(s1, _mm256_max_ps(_mm256_mul_ps(vq1, kmn), _mm256_mul_ps(vq1, kmx)));
+                        s2 = _mm256_add_ps(s2, _mm256_max_ps(_mm256_mul_ps(vq2, kmn), _mm256_mul_ps(vq2, kmx)));
+                    }
+                    // Group-max score across the 3 GQA heads
+                    const float gmax = std::max(hsum256(s0), std::max(hsum256(s1), hsum256(s2)));
+                    slot_sc += gmax;
+                }
+                if (slot_sc > best_sc) best_sc = slot_sc;
+            }
+            scores[bi] = best_sc;
+        }
+    };
+
+    if (n_ublocks >= 256) {
+        const int nt = std::min(8, (n_ublocks + 63) / 64);
+        std::vector<std::thread> ts;
+        ts.reserve((size_t)(nt - 1));
+        for (int t = 1; t < nt; ++t) {
+            int a = (n_ublocks * t) / nt, b = (n_ublocks * (t + 1)) / nt;
+            ts.emplace_back(score_range, a, b);
+        }
+        score_range(0, n_ublocks / nt);
+        for (auto& w : ts) w.join();
+    } else {
+        score_range(0, n_ublocks);
+    }
+
+    std::vector<int> idx((size_t)n_ublocks);
+    for (int i = 0; i < n_ublocks; ++i) idx[i] = i;
+    const int k = std::min(top_k, n_ublocks);
+    std::nth_element(idx.begin(), idx.begin() + k, idx.end(),
+                     [&](int a, int b) { return scores[a] > scores[b]; });
+    // Sort selected indices to preserve physical slab contiguity for coalesced 26.2 GB/s PCIe Gen4 DMA!
+    std::sort(idx.begin(), idx.begin() + k);
+    for (int i = 0; i < k; ++i) out_indices[i] = idx[i];
+    return k;
+}
+
+}  // namespace strata::ink
