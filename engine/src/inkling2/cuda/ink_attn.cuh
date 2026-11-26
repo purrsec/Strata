@@ -33,37 +33,102 @@ enum class InkKvDtype : int {
 // Per-visit KV cache descriptor passed by value to attention kernels (CUDA-Graph friendly!)
 // Supports zero-copy Host KV Offloading: global tokens [0..dev_cap-1] live in VRAM and [dev_cap..cap_pos-1]
 // live in mapped pinned host RAM (cudaHostAllocMapped + cudaHostGetDevicePointer) so lossless FP16 KV never OOMs!
+constexpr int kInkKvBlock      = 256;
+constexpr int kInkKvBlockShift = 8;
+constexpr int kInkKvBlockMask  = kInkKvBlock - 1;
+constexpr int kInkSlabBlocks   = 256;   // 65,536 tokens per on-demand host RAM slab (2.0 GiB FP16 across 8 global visits)
+constexpr int kInkSlabShift    = 8;
+constexpr int kInkSlabMask     = kInkSlabBlocks - 1;
+constexpr int kInkMaxHostSlabs = 128;   // up to 8.38M tokens aggregate pool!
+
 struct InkKvVisitDesc {
-    __half*  k_f16;      // [max_slots, dev_cap, 8, 128] (kv_fmt == 0)
+    __half*  k_f16;      // Legacy: [max_slots, dev_cap, 8, 128]; Paged: [dev_blocks, 256, 8, 128]
     __half*  v_f16;
-    uint8_t* k_f8;       // [max_slots, dev_cap, 8, 128] (FP8 E4M3 / K8V8 int8 / K8V4 int8)
-    uint8_t* v_f8;       // [max_slots, dev_cap, 8, 128] (FP8 / K8V8) or [max_slots, dev_cap, 8, 64] (K8V4 packed 4-bit)
-    float*   k_sc;       // [max_slots, dev_cap, 8] per-head FP32 scale
+    uint8_t* k_f8;       // Legacy: [max_slots, dev_cap, 8, 128]; Paged: [dev_blocks, 256, 8, 128]
+    uint8_t* v_f8;       // FP8/K8V8 [.., 128] or K8V4 [.., 64]
+    float*   k_sc;       // [.., 8] per-head FP32 scale
     float*   v_sc;
-    __half*  h_k_f16;    // Mapped pinned host K [max_slots, host_cap, 8, 128] (global visits only)
+    __half*  h_k_f16;    // Legacy mapped pinned host K [max_slots, host_cap, 8, 128]
     __half*  h_v_f16;
     uint8_t* h_k_f8;
     uint8_t* h_v_f8;
     float*   h_k_sc;
     float*   h_v_sc;
-    int      cap_pos;    // SWA: swa_ring; Global: dev_cap + host_cap (total allocated elastic capacity <= max_ctx)
-    int      dev_cap;    // Global: VRAM-resident prefix [0..dev_cap-1]; 0 when 100% host-offloaded
-    int      host_cap;   // Global: mapped pinned host tail [dev_cap..dev_cap+host_cap-1]; 0 when VRAM-only
+    // Unified Paged Global KV (page_table != nullptr): 1M+ ctx/slot, shared VRAM pool + on-demand host slabs, zero-copy prefix sharing!
+    const int32_t* page_table;   // [max_slots, page_stride] logical block -> phys block (< dev_blocks: VRAM, >= dev_blocks: host slab)
+    int            page_stride;  // blocks per slot = (max_ctx + 255) / 256
+    int            dev_blocks;   // VRAM blocks in k_f16/v_f16 (0..dev_blocks-1)
+    void* const*   h_slabs_k;    // device array [kInkMaxHostSlabs] of mapped host K ptrs
+    void* const*   h_slabs_v;    // device array [kInkMaxHostSlabs] of mapped host V ptrs
+    float* const*  h_slabs_ksc;  // device array [kInkMaxHostSlabs] of mapped host K scale ptrs
+    float* const*  h_slabs_vsc;  // device array [kInkMaxHostSlabs] of mapped host V scale ptrs
+    int      cap_pos;    // SWA: swa_ring; Global: max addressable positions
+    int      dev_cap;    // Legacy VRAM-resident prefix
+    int      host_cap;   // Legacy mapped pinned host tail
     bool     is_swa;
     uint8_t  kv_fmt;     // 0=FP16, 1=FP8, 2=K8V8, 3=K8V4
 };
 
-// Unified inline 4-dim KV loader for all 4 formats (FP16 / FP8 / K8V8 / K8V4) + transparent Host KV Offload!
-__device__ __forceinline__ void ink_kv_load4(
-    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane, float4& kv4, float4& vv4) {
+// Resolve physical (K/V/scale base pointers + hbase head index) for both legacy contiguous and unified paged global KV!
+struct InkKvAddr {
+    const void*  pk;
+    const void*  pv;
+    const float* pksc;
+    const float* pvsc;
+    size_t       hbase;
+    bool         valid;
+};
+
+__device__ __forceinline__ InkKvAddr ink_kv_resolve(const InkKvVisitDesc& kv, int sl, int p_idx, int kh) {
+    InkKvAddr a{};
+    if (!kv.is_swa && kv.page_table != nullptr) {
+        const int blk  = p_idx >> kInkKvBlockShift;
+        const int off  = p_idx & kInkKvBlockMask;
+        const int phys = kv.page_table[(size_t)sl * kv.page_stride + blk];
+        if (phys < 0) { a.valid = false; return a; }
+        a.valid = true;
+        if (phys < kv.dev_blocks) {
+            a.hbase = ((size_t)phys * kInkKvBlock + off) * kInkKVHeads + kh;
+            if (kv.kv_fmt == 0) { a.pk = kv.k_f16; a.pv = kv.v_f16; }
+            else                { a.pk = kv.k_f8;  a.pv = kv.v_f8; a.pksc = kv.k_sc; a.pvsc = kv.v_sc; }
+        } else {
+            const int h_idx = phys - kv.dev_blocks;
+            const int slab  = h_idx >> kInkSlabShift;
+            const int boff  = h_idx & kInkSlabMask;
+            a.hbase = ((size_t)boff * kInkKvBlock + off) * kInkKVHeads + kh;
+            a.pk = kv.h_slabs_k[slab];
+            a.pv = kv.h_slabs_v[slab];
+            if (kv.kv_fmt != 0) { a.pksc = kv.h_slabs_ksc[slab]; a.pvsc = kv.h_slabs_vsc[slab]; }
+        }
+        return a;
+    }
     const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
     const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
     const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
-    const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    a.hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    a.valid = true;
+    if (kv.kv_fmt == 0) {
+        a.pk = use_host ? (const void*)kv.h_k_f16 : (const void*)kv.k_f16;
+        a.pv = use_host ? (const void*)kv.h_v_f16 : (const void*)kv.v_f16;
+    } else {
+        a.pk   = use_host ? (const void*)kv.h_k_f8  : (const void*)kv.k_f8;
+        a.pv   = use_host ? (const void*)kv.h_v_f8  : (const void*)kv.v_f8;
+        a.pksc = use_host ? kv.h_k_sc : kv.k_sc;
+        a.pvsc = use_host ? kv.h_v_sc : kv.v_sc;
+    }
+    return a;
+}
+
+// Unified inline 4-dim KV loader for all 4 formats (FP16 / FP8 / K8V8 / K8V4) + transparent Host KV Offload!
+__device__ __forceinline__ void ink_kv_load4(
+    const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int lane, float4& kv4, float4& vv4) {
+    const InkKvAddr a = ink_kv_resolve(kv, sl, p_idx, kh);
+    if (!a.valid) { kv4 = make_float4(0,0,0,0); vv4 = make_float4(0,0,0,0); return; }
+    const size_t hbase = a.hbase;
     const size_t base  = hbase * kInkHeadDim + (size_t)lane * 4;
     if (kv.kv_fmt == 0) {
-        const __half* pk = use_host ? kv.h_k_f16 : kv.k_f16;
-        const __half* pv = use_host ? kv.h_v_f16 : kv.v_f16;
+        const __half* pk = reinterpret_cast<const __half*>(a.pk);
+        const __half* pv = reinterpret_cast<const __half*>(a.pv);
         const uint2 k2 = *(const uint2*)(pk + base);
         const uint2 v2 = *(const uint2*)(pv + base);
         const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
@@ -73,10 +138,10 @@ __device__ __forceinline__ void ink_kv_load4(
         kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
         vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
     } else if (kv.kv_fmt == 1) {
-        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
-        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
-        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
-        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint8_t* pk = reinterpret_cast<const uint8_t*>(a.pk);
+        const uint8_t* pv = reinterpret_cast<const uint8_t*>(a.pv);
+        const float sk = a.pksc[hbase];
+        const float sv = a.pvsc[hbase];
         const uint32_t k4 = *(const uint32_t*)(pk + base);
         const uint32_t v4 = *(const uint32_t*)(pv + base);
         const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
@@ -86,10 +151,10 @@ __device__ __forceinline__ void ink_kv_load4(
         kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
         vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
     } else if (kv.kv_fmt == 2) {
-        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
-        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
-        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
-        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint8_t* pk = reinterpret_cast<const uint8_t*>(a.pk);
+        const uint8_t* pv = reinterpret_cast<const uint8_t*>(a.pv);
+        const float sk = a.pksc[hbase];
+        const float sv = a.pvsc[hbase];
         const uint32_t k4 = *(const uint32_t*)(pk + base);
         const uint32_t v4 = *(const uint32_t*)(pv + base);
         kv4 = make_float4((float)(int8_t)(k4 & 0xFFu) * sk, (float)(int8_t)((k4 >> 8) & 0xFFu) * sk,
@@ -97,10 +162,10 @@ __device__ __forceinline__ void ink_kv_load4(
         vv4 = make_float4((float)(int8_t)(v4 & 0xFFu) * sv, (float)(int8_t)((v4 >> 8) & 0xFFu) * sv,
                           (float)(int8_t)((v4 >> 16) & 0xFFu) * sv, (float)(int8_t)(v4 >> 24) * sv);
     } else {
-        const uint8_t* pk = use_host ? kv.h_k_f8 : kv.k_f8;
-        const uint8_t* pv = use_host ? kv.h_v_f8 : kv.v_f8;
-        const float sk = (use_host ? kv.h_k_sc : kv.k_sc)[hbase];
-        const float sv = (use_host ? kv.h_v_sc : kv.v_sc)[hbase];
+        const uint8_t* pk = reinterpret_cast<const uint8_t*>(a.pk);
+        const uint8_t* pv = reinterpret_cast<const uint8_t*>(a.pv);
+        const float sk = a.pksc[hbase];
+        const float sv = a.pvsc[hbase];
         const uint32_t k4 = *(const uint32_t*)(pk + base);
         kv4 = make_float4((float)(int8_t)(k4 & 0xFFu) * sk, (float)(int8_t)((k4 >> 8) & 0xFFu) * sk,
                           (float)(int8_t)((k4 >> 16) & 0xFFu) * sk, (float)(int8_t)(k4 >> 24) * sk);
@@ -113,16 +178,15 @@ __device__ __forceinline__ void ink_kv_load4(
     }
 }
 
-// Unified 128-thread per-head KV store (all 4 formats + transparent Host KV Offload + FP16 overflow clamp!)
+// Unified 128-thread per-head KV store (all 4 formats + Paged/Host KV + FP16 overflow clamp!)
 __device__ __forceinline__ void ink_kv_store_128(
     const InkKvVisitDesc& kv, int sl, int p_idx, int kh, int tid, float val, bool is_k, float sh[4]) {
-    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
-    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
-    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
-    const size_t hbase = ((size_t)sl * stride + pos_l) * kInkKVHeads + kh;
+    const InkKvAddr a = ink_kv_resolve(kv, sl, p_idx, kh);
+    if (!a.valid) return;
+    const size_t hbase = a.hbase;
     const size_t base  = hbase * kInkHeadDim;
     if (kv.kv_fmt == 0) {
-        __half* dst = is_k ? (use_host ? kv.h_k_f16 : kv.k_f16) : (use_host ? kv.h_v_f16 : kv.v_f16);
+        __half* dst = const_cast<__half*>(reinterpret_cast<const __half*>(is_k ? a.pk : a.pv));
         dst[base + tid] = __float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f));
         return;
     }
@@ -130,8 +194,8 @@ __device__ __forceinline__ void ink_kv_store_128(
     if ((tid & 31) == 0) sh[tid >> 5] = mv;
     __syncthreads();
     const float am = fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
-    uint8_t* dst8 = is_k ? (use_host ? kv.h_k_f8 : kv.k_f8) : (use_host ? kv.h_v_f8 : kv.v_f8);
-    float* dst_sc = is_k ? (use_host ? kv.h_k_sc : kv.k_sc) : (use_host ? kv.h_v_sc : kv.v_sc);
+    uint8_t* dst8 = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(is_k ? a.pk : a.pv));
+    float* dst_sc = const_cast<float*>(is_k ? a.pksc : a.pvsc);
     if (kv.kv_fmt == 1) {
         const float sc = am > 0.0f ? (am * (1.0f / 448.0f)) : 1.0f;
         const __nv_fp8_e4m3 qv(fminf(fmaxf(val / sc, -448.0f), 448.0f));
@@ -493,7 +557,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     float* __restrict__ part_l,           // [M, 24, n_splits]
     float* __restrict__ part_o,           // [M, 24, n_splits, 128]
     int M,
-    int n_splits = kInkAttnSplits) {
+    int n_splits = kInkAttnSplits,
+    int n_splits_stride = 0,
+    int skip_host = 0) {
+    const int sp_stride = (n_splits_stride > 0) ? n_splits_stride : n_splits;
     const int kh = blockIdx.x;  // 0..7
     const int sp = blockIdx.y;  // 0..n_splits-1
     const int m  = blockIdx.z;  // 0..M-1
@@ -555,7 +622,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
         }
     };
 
-    // Unified bit-exact loop: every key kp (committed OR tree ancestor!) lands in the EXACT same (split, warp) as M=1!
+    // Unified bit-exact loop (with O(1) block-skip over host blocks when CPU handles host KV!)
     for (int kp = s_beg + warp; kp < s_end; kp += 4) {
         float4 kv4, vv4;
         if (tree_k && kp >= tp0) {
@@ -565,6 +632,14 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
             vv4 = *(const float4*)(tree_v + tbase);
         } else {
             if (!kv.is_swa && (kp < 0 || kp >= kv.cap_pos)) continue;
+            if (skip_host && !kv.is_swa && kv.page_table != nullptr) {
+                const int blk = kp >> kInkKvBlockShift;
+                const int phys = kv.page_table[(size_t)sl * kv.page_stride + blk];
+                if (phys < 0 || phys >= kv.dev_blocks) {
+                    kp = ((blk + 1) << kInkKvBlockShift) + warp - 4;
+                    continue;
+                }
+            }
             const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
             ink_kv_load4(kv, sl, p_idx, kh, lane, kv4, vv4);
         }
@@ -588,7 +663,7 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
             float w2 = sm_l[2] > 0.0f ? __expf(sm_m[2] - mg) : 0.0f;
             float w3 = sm_l[3] > 0.0f ? __expf(sm_m[3] - mg) : 0.0f;
             const float lt = sm_l[0] * w0 + sm_l[1] * w1 + sm_l[2] * w2 + sm_l[3] * w3;
-            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_splits + sp;
+            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * sp_stride + sp;
             if (lane == 0) { part_m[idx_sp] = mg; part_l[idx_sp] = lt; }
             *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(
                 sm_a[0][lane * 4 + 0] * w0 + sm_a[1][lane * 4 + 0] * w1 + sm_a[2][lane * 4 + 0] * w2 + sm_a[3][lane * 4 + 0] * w3,
@@ -597,6 +672,26 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
                 sm_a[0][lane * 4 + 3] * w0 + sm_a[1][lane * 4 + 3] * w1 + sm_a[2][lane * 4 + 3] * w2 + sm_a[3][lane * 4 + 3] * w3);
         }
         __syncthreads();
+    }
+}
+
+// Inject CPU-computed host-KV partial [M, 24, 130] (128 o + m + l) into split index `dst_sp` of Split-K buffers!
+__global__ void __launch_bounds__(128) k_ink_attn_inject_split(
+    const float* __restrict__ host_in,    // [M, 24, 130]
+    float* __restrict__ part_m,           // [M, 24, n_splits]
+    float* __restrict__ part_l,           // [M, 24, n_splits]
+    float* __restrict__ part_o,           // [M, 24, n_splits, 128]
+    int M, int n_splits, int dst_sp) {
+    const int h = blockIdx.x;
+    const int m = blockIdx.y;
+    const int d = threadIdx.x;
+    if (h >= kInkHeads || m >= M) return;
+    const float* src = host_in + ((size_t)m * kInkHeads + h) * 130;
+    const size_t idx_sp = ((size_t)m * kInkHeads + h) * n_splits + dst_sp;
+    part_o[idx_sp * kInkHeadDim + d] = src[d];
+    if (d == 0) {
+        part_m[idx_sp] = src[128];
+        part_l[idx_sp] = src[129];
     }
 }
 
@@ -768,65 +863,76 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     InkKvVisitDesc kv,
     int slot0, int k_start, int K_len,
     void* __restrict__ k_out_v,         // [24, K_len, 128] BF16 or FP16
-    void* __restrict__ v_out_v) {       // [24, K_len, 128] BF16 or FP16
+    void* __restrict__ v_out_v,         // [24, K_len, 128] BF16 or FP16
+    const float* __restrict__ cur_k = nullptr,
+    const float* __restrict__ cur_v = nullptr,
+    int cur_p0 = 0) {
     const int kh = blockIdx.x;  // 0..7
     const int ki = blockIdx.y;  // 0..K_len-1
     const int d  = threadIdx.x; // 0..127
     if (kh >= kInkKVHeads || ki >= K_len) return;
     const int kp = k_start + ki;
-    const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : min(max(kp, 0), kv.cap_pos - 1);
-    const bool use_host = (!kv.is_swa && kv.host_cap > 0 && p_idx >= kv.dev_cap);
-    const int stride = use_host ? kv.host_cap : (kv.host_cap > 0 ? kv.dev_cap : kv.cap_pos);
-    const int pos_l  = use_host ? (p_idx - kv.dev_cap) : p_idx;
-    const size_t hbase = ((size_t)slot0 * stride + pos_l) * kInkKVHeads + kh;
-    const size_t base  = hbase * kInkHeadDim + d;
-    const __half*  pk16 = use_host ? kv.h_k_f16 : kv.k_f16;
-    const __half*  pv16 = use_host ? kv.h_v_f16 : kv.v_f16;
-    const uint8_t* pk8  = use_host ? kv.h_k_f8  : kv.k_f8;
-    const uint8_t* pv8  = use_host ? kv.h_v_f8  : kv.v_f8;
-    const float*   pksc = use_host ? kv.h_k_sc  : kv.k_sc;
-    const float*   pvsc = use_host ? kv.h_v_sc  : kv.v_sc;
-    uint16_t kb, vb;
-    if constexpr (USE_FP16) {
-        if (kv.kv_fmt == 0) {
-            kb = *reinterpret_cast<const uint16_t*>(&pk16[base]);
-            vb = *reinterpret_cast<const uint16_t*>(&pv16[base]);
-        } else {
-            float kf, vf;
-            if (kv.kv_fmt == 1) {
-                kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
-                vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
-            } else if (kv.kv_fmt == 2) {
-                kf = (float)(int8_t)pk8[base] * pksc[hbase];
-                vf = (float)(int8_t)pv8[base] * pvsc[hbase];
-            } else {
-                kf = (float)(int8_t)pk8[base] * pksc[hbase];
-                const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
-                const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
-                vf = (float)qv * pvsc[hbase];
-            }
-            kb = pf_cvt_from_f32<true>(kf);
-            vb = pf_cvt_from_f32<true>(vf);
-        }
+    uint16_t kb = 0u, vb = 0u;
+    if (cur_k != nullptr && kp >= cur_p0) {
+        const size_t cidx = ((size_t)(kp - cur_p0) * kInkKVHeads + kh) * kInkHeadDim + d;
+        const float kf = fminf(fmaxf(cur_k[cidx], -65504.0f), 65504.0f);
+        const float vf = fminf(fmaxf(cur_v[cidx], -65504.0f), 65504.0f);
+        kb = pf_cvt_from_f32<USE_FP16>(kf);
+        vb = pf_cvt_from_f32<USE_FP16>(vf);
     } else {
-        float kf, vf;
-        if (kv.kv_fmt == 0) {
-            kf = __half2float(pk16[base]);
-            vf = __half2float(pv16[base]);
-        } else if (kv.kv_fmt == 1) {
-            kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
-            vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
-        } else if (kv.kv_fmt == 2) {
-            kf = (float)(int8_t)pk8[base] * pksc[hbase];
-            vf = (float)(int8_t)pv8[base] * pvsc[hbase];
-        } else {
-            kf = (float)(int8_t)pk8[base] * pksc[hbase];
-            const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
-            const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
-            vf = (float)qv * pvsc[hbase];
+        const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : min(max(kp, 0), kv.cap_pos - 1);
+        const InkKvAddr a = ink_kv_resolve(kv, slot0, p_idx, kh);
+        if (a.valid) {
+            const size_t hbase = a.hbase;
+            const size_t base  = hbase * kInkHeadDim + d;
+            const __half*  pk16 = reinterpret_cast<const __half*>(a.pk);
+            const __half*  pv16 = reinterpret_cast<const __half*>(a.pv);
+            const uint8_t* pk8  = reinterpret_cast<const uint8_t*>(a.pk);
+            const uint8_t* pv8  = reinterpret_cast<const uint8_t*>(a.pv);
+            const float*   pksc = a.pksc;
+            const float*   pvsc = a.pvsc;
+            if constexpr (USE_FP16) {
+                if (kv.kv_fmt == 0) {
+                    kb = *reinterpret_cast<const uint16_t*>(&pk16[base]);
+                    vb = *reinterpret_cast<const uint16_t*>(&pv16[base]);
+                } else {
+                    float kf, vf;
+                    if (kv.kv_fmt == 1) {
+                        kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
+                        vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
+                    } else if (kv.kv_fmt == 2) {
+                        kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                        vf = (float)(int8_t)pv8[base] * pvsc[hbase];
+                    } else {
+                        kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                        const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
+                        const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
+                        vf = (float)qv * pvsc[hbase];
+                    }
+                    kb = pf_cvt_from_f32<true>(kf);
+                    vb = pf_cvt_from_f32<true>(vf);
+                }
+            } else {
+                float kf, vf;
+                if (kv.kv_fmt == 0) {
+                    kf = __half2float(pk16[base]);
+                    vf = __half2float(pv16[base]);
+                } else if (kv.kv_fmt == 1) {
+                    kf = e4m3_to_f32(pk8[base]) * pksc[hbase];
+                    vf = e4m3_to_f32(pv8[base]) * pvsc[hbase];
+                } else if (kv.kv_fmt == 2) {
+                    kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                    vf = (float)(int8_t)pv8[base] * pvsc[hbase];
+                } else {
+                    kf = (float)(int8_t)pk8[base] * pksc[hbase];
+                    const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
+                    const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
+                    vf = (float)qv * pvsc[hbase];
+                }
+                kb = pf_cvt_from_f32<false>(kf);
+                vb = pf_cvt_from_f32<false>(vf);
+            }
         }
-        kb = pf_cvt_from_f32<false>(kf);
-        vb = pf_cvt_from_f32<false>(vf);
     }
     uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
     uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);
@@ -996,23 +1102,24 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
     const float* __restrict__ scores,     // [24, C, K_t] F32 (K_t <= 2048)
     const float* __restrict__ rel_table,  // [M, 24, 1025]
     void* __restrict__ probs_v,           // [24, C, K_t] BF16 or FP16 (unnormalized exp(s - m_new))
-    float* __restrict__ m_acc,            // [24, C] in/out
-    float* __restrict__ l_acc,            // [24, C] in/out
+    float* __restrict__ m_acc,            // [24, m_stride] in/out
+    float* __restrict__ l_acc,            // [24, m_stride] in/out
     float* __restrict__ alpha_out,        // [24, C] exp(m_old - m_new)
-    int q0, int C, int k_tile_start, int K_t, int p0, bool is_swa) {
+    int q0, int C, int k_tile_start, int K_t, int p0, bool is_swa, int m_stride = 0) {
     const int ci = blockIdx.x;  // 0..C-1
     const int h  = blockIdx.y;  // 0..23
     if (ci >= C || h >= kInkHeads) return;
     const int tid = threadIdx.x;
     const int m   = q0 + ci;
     const int qp  = p0 + m;
-    const size_t st_idx = (size_t)h * C + ci;
+    const size_t st_idx  = (size_t)h * C + ci;
+    const size_t acc_idx = (m_stride > 0) ? ((size_t)h * m_stride + m) : st_idx;
     const float* sc_row = scores + st_idx * K_t;
     const float* rt     = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
     uint16_t* pr_row    = reinterpret_cast<uint16_t*>(probs_v) + st_idx * K_t;
     __shared__ float sh[32];
 
-    const float m_old = m_acc[st_idx];
+    const float m_old = m_acc[acc_idx];
     float reg_v[8];
     uint8_t reg_ok[8];
     float mx = (tid == 0) ? m_old : -1e30f;
@@ -1058,8 +1165,8 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
     }
     tile_l = block_sum(tile_l, sh);
     if (tid == 0) {
-        m_acc[st_idx]     = m_new;
-        l_acc[st_idx]     = l_acc[st_idx] * alpha + tile_l;
+        m_acc[acc_idx]    = m_new;
+        l_acc[acc_idx]    = l_acc[acc_idx] * alpha + tile_l;
         alpha_out[st_idx] = alpha;
     }
 }
@@ -1067,22 +1174,24 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
 __global__ void __launch_bounds__(128) k_ink_pf_accum_tile(
     const float* __restrict__ o_tile,     // [24, C, 128]
     const float* __restrict__ alpha_in,   // [24, C]
-    const float* __restrict__ l_acc,      // [24, C]
-    float* __restrict__ o_acc,            // [24, C, 128]
+    const float* __restrict__ l_acc,      // [24, m_stride]
+    float* __restrict__ o_acc,            // [24, m_stride, 128]
     const float* __restrict__ gate_attn,  // [M, 24, 128]
     float* __restrict__ out,              // [M, 24, 128] (written on is_last!)
-    int q0, int C, bool is_last) {
+    int q0, int C, bool is_last, int m_stride = 0) {
     const int h  = blockIdx.x;  // 0..23
     const int ci = blockIdx.y;  // 0..C-1
     const int d  = threadIdx.x; // 0..127
     if (h >= kInkHeads || ci >= C) return;
-    const size_t st_idx = (size_t)h * C + ci;
-    const size_t oi = st_idx * kInkHeadDim + d;
-    const float v = o_acc[oi] * alpha_in[st_idx] + o_tile[oi];
+    const size_t st_idx  = (size_t)h * C + ci;
+    const size_t acc_idx = (m_stride > 0) ? ((size_t)h * m_stride + (q0 + ci)) : st_idx;
+    const size_t ti = st_idx  * kInkHeadDim + d;
+    const size_t oi = acc_idx * kInkHeadDim + d;
+    const float v = o_acc[oi] * alpha_in[st_idx] + o_tile[ti];
     if (!is_last) {
         o_acc[oi] = v;
     } else {
-        float res = v / l_acc[st_idx];
+        float res = v / l_acc[acc_idx];
         const size_t ob = ((size_t)(q0 + ci) * kInkHeads + h) * kInkHeadDim + d;
         if (gate_attn) res *= 1.0f / (1.0f + __expf(-gate_attn[ob]));
         out[ob] = res;

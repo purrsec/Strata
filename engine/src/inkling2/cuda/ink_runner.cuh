@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ink_attn.cuh"
+#include "ink_host_kv_attn.hpp"
 #include "ink_cuda.cuh"
 #include "ink_hybrid.cuh"
 #include "ink_kernels.cuh"
@@ -1890,12 +1891,366 @@ struct InkCudaRunner {
     int max_passes_override = 0;  // 0 = full 3 passes (48 visits); 1 or 2 = early-pass exit probe!
     InkKvDtype kv_dtype = InkKvDtype::FP16;
 
-    // KV Cache (48 visits: 40 SWA in VRAM, 8 Global split across VRAM + zero-copy mapped pinned host RAM!)
+    // KV Cache (48 visits: 40 SWA in VRAM, 8 Global in Unified Paged VRAM + On-Demand Pinned Host Slabs OR legacy!)
     InkKvVisitDesc kv_desc[kInkVisits]{};
     void* host_kv_raw_k[kInkVisits]   = {};
     void* host_kv_raw_v[kInkVisits]   = {};
     void* host_kv_raw_ksc[kInkVisits] = {};
     void* host_kv_raw_vsc[kInkVisits] = {};
+
+    // Unified Paged Global KV state (single-GPU, 1M+ ctx/slot, shared VRAM pool + on-demand 64K-token host slabs)
+    bool paged_kv_active = false;
+    int  kv_page_stride  = 0;
+    int  kv_dev_blocks   = 0;
+    int  kv_host_slabs   = 0;
+    uint64_t active_slots_mask = 0;
+    int32_t* d_page_table = nullptr;
+    std::vector<int32_t> h_page_table;
+    std::vector<int32_t> blk_ref;
+    std::vector<int32_t> free_dev_blks;
+    std::vector<int32_t> free_host_blks;
+    void**  d_h_slabs_k[kInkVisits]   = {};
+    void**  d_h_slabs_v[kInkVisits]   = {};
+    float** d_h_slabs_ksc[kInkVisits] = {};
+    float** d_h_slabs_vsc[kInkVisits] = {};
+    struct HostSlabVisit {
+        void* raw_k = nullptr; void* dev_k = nullptr;
+        void* raw_v = nullptr; void* dev_v = nullptr;
+        void* raw_ksc = nullptr; float* dev_ksc = nullptr;
+        void* raw_vsc = nullptr; float* dev_vsc = nullptr;
+    };
+    std::vector<HostSlabVisit> host_slabs[kInkVisits];
+
+    // CPU-GPU Hybrid Host-KV Split-K Attention scratch (zero overhead when 0 host blocks!)
+    static constexpr int kCpuHostMaxM = 16;
+    float* h_cpu_q_pin     = nullptr;   // [16, 24, 128] pinned
+    float* h_cpu_rt_pin    = nullptr;   // [16, 24, 1025] pinned
+    float* h_cpu_split_pin = nullptr;   // [16, 24, 130] pinned
+    float* d_cpu_split     = nullptr;   // [16, 24, 130] device
+    bool   step_cpu_host_kv = false;
+    bool   step_cpu_need_rt = false;
+    int32_t cpu_slot_qp[kCpuHostMaxM]{};
+    std::vector<InkHostKvUniqueBlock> cpu_ublocks;
+    std::vector<int32_t> cpu_dedup_idx;   // host block index -> index in cpu_ublocks (O(1) dedup, zero hash overhead!)
+
+    bool prepare_cpu_host_kv_plan(const int32_t* slot_arr, int slot0, const int32_t* pos_arr, int M) {
+        step_cpu_host_kv = false;
+        step_cpu_need_rt = false;
+        static const bool cpu_hk_on = [] { const char* e = std::getenv("STRATA_INK_CPU_HOST_KV"); return !(e && e[0] == '0'); }();
+        if (!cpu_hk_on || !paged_kv_active || kv_dtype != InkKvDtype::FP16 || kv_host_slabs <= 0 || M <= 0 || M > kCpuHostMaxM || m.ls_active) {
+            return false;
+        }
+        const int max_host_blks = kv_host_slabs * kInkSlabBlocks;
+        if ((int)cpu_dedup_idx.size() < max_host_blks) cpu_dedup_idx.assign((size_t)max_host_blks, -1);
+        cpu_ublocks.clear();
+
+        for (int mi = 0; mi < M; ++mi) {
+            const int sl = slot_arr ? slot_arr[mi] : slot0;
+            const int qp = pos_arr[mi];
+            cpu_slot_qp[mi] = qp;
+            const uint32_t bit = 1u << mi;
+            const int nb = (qp >> kInkKvBlockShift) + 1;
+            const int32_t* pt = h_page_table.data() + (size_t)sl * kv_page_stride;
+            for (int b = 0; b < nb && b < kv_page_stride; ++b) {
+                const int32_t phys = pt[b];
+                if (phys >= kv_dev_blocks) {
+                    const int hi = phys - kv_dev_blocks;
+                    const int pos_s = b << kInkKvBlockShift;
+                    const int plen  = std::min(kInkKvBlock, qp - pos_s + 1);
+                    if (plen <= 0) continue;
+                    if ((qp - (pos_s + plen - 1)) < kInkRelExtent) step_cpu_need_rt = true;
+                    const int existing = (hi >= 0 && hi < max_host_blks) ? cpu_dedup_idx[hi] : -1;
+                    if (existing >= 0 && cpu_ublocks[existing].pos_start == pos_s) {
+                        cpu_ublocks[existing].slot_mask |= bit;
+                        if (plen > cpu_ublocks[existing].max_pos_len) cpu_ublocks[existing].max_pos_len = plen;
+                    } else {
+                        InkHostKvUniqueBlock ub{};
+                        ub.slab = hi >> kInkSlabShift;
+                        ub.boff = hi & kInkSlabMask;
+                        ub.pos_start = pos_s;
+                        ub.max_pos_len = plen;
+                        ub.slot_mask = bit;
+                        if (hi >= 0 && hi < max_host_blks && existing < 0) cpu_dedup_idx[hi] = (int32_t)cpu_ublocks.size();
+                        cpu_ublocks.push_back(ub);
+                    }
+                }
+            }
+        }
+        // Reset touched entries in cpu_dedup_idx in O(n_ublocks)
+        for (const auto& ub : cpu_ublocks) {
+            const int hi = (ub.slab << kInkSlabShift) | ub.boff;
+            if (hi >= 0 && hi < max_host_blks) cpu_dedup_idx[hi] = -1;
+        }
+        if (cpu_ublocks.empty()) return false;
+        if (!h_cpu_q_pin) {
+            h_cpu_q_pin     = halloc_pinned<float>((size_t)kCpuHostMaxM * kInkHeads * kInkHeadDim);
+            h_cpu_rt_pin    = halloc_pinned<float>((size_t)kCpuHostMaxM * kInkHeads * (kInkRelExtent + 1));
+            h_cpu_split_pin = halloc_pinned<float>((size_t)kCpuHostMaxM * kInkHeads * 130);
+            d_cpu_split     = dalloc<float>((size_t)kCpuHostMaxM * kInkHeads * 130);
+        }
+        step_cpu_host_kv = true;
+        return true;
+    }
+
+    bool paged_alloc_host_slab() {
+        if (kv_host_slabs >= kInkMaxHostSlabs) return false;
+        const size_t per_pos = kv_bytes_per_visit_pos(kv_dtype);
+        const size_t slab_bytes = (size_t)8 * kInkSlabBlocks * kInkKvBlock * per_pos;
+        const uint64_t avail = ink_ram_available_bytes();
+        const uint64_t floor_ram = 4ull << 30;
+        if (avail < slab_bytes + floor_ram) {
+            std::fprintf(stderr, "[InkPagedKV] Host RAM floor reached (avail=%.1f GiB, need=%.2f GiB + 4 GiB)\n",
+                         (double)avail / 1073741824.0, (double)slab_bytes / 1073741824.0);
+            return false;
+        }
+        const int s_idx = kv_host_slabs;
+        const size_t elems = (size_t)kInkSlabBlocks * kInkKvBlock * kInkKVHeads * kInkHeadDim;
+        const size_t sc_n  = (size_t)kInkSlabBlocks * kInkKvBlock * kInkKVHeads;
+        bool ok = true;
+        std::vector<int> done_v;
+        for (int v = 0; v < kInkVisits && ok; ++v) {
+            if (kv_desc[v].is_swa) continue;
+            HostSlabVisit hs{};
+            if (kv_dtype == InkKvDtype::FP16) {
+                __half *dk = nullptr, *dv = nullptr;
+                ok = alloc_mapped_host<__half>(elems, hs.raw_k, dk) && alloc_mapped_host<__half>(elems, hs.raw_v, dv);
+                hs.dev_k = dk; hs.dev_v = dv;
+            } else {
+                uint8_t *dk = nullptr, *dv = nullptr;
+                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : elems;
+                ok = alloc_mapped_host<uint8_t>(elems, hs.raw_k, dk) && alloc_mapped_host<uint8_t>(vb, hs.raw_v, dv)
+                  && alloc_mapped_host<float>(sc_n, hs.raw_ksc, hs.dev_ksc) && alloc_mapped_host<float>(sc_n, hs.raw_vsc, hs.dev_vsc);
+                hs.dev_k = dk; hs.dev_v = dv;
+            }
+            if (ok) {
+                host_slabs[v].push_back(hs);
+                done_v.push_back(v);
+                INK_CK(cudaMemcpy(d_h_slabs_k[v] + s_idx, &hs.dev_k, sizeof(void*), cudaMemcpyHostToDevice));
+                INK_CK(cudaMemcpy(d_h_slabs_v[v] + s_idx, &hs.dev_v, sizeof(void*), cudaMemcpyHostToDevice));
+                if (kv_dtype != InkKvDtype::FP16) {
+                    INK_CK(cudaMemcpy(d_h_slabs_ksc[v] + s_idx, &hs.dev_ksc, sizeof(float*), cudaMemcpyHostToDevice));
+                    INK_CK(cudaMemcpy(d_h_slabs_vsc[v] + s_idx, &hs.dev_vsc, sizeof(float*), cudaMemcpyHostToDevice));
+                }
+            } else {
+                if (hs.raw_k) cudaFreeHost(hs.raw_k);
+                if (hs.raw_v) cudaFreeHost(hs.raw_v);
+                if (hs.raw_ksc) cudaFreeHost(hs.raw_ksc);
+                if (hs.raw_vsc) cudaFreeHost(hs.raw_vsc);
+            }
+        }
+        if (!ok) {
+            for (int v : done_v) {
+                auto hs = host_slabs[v].back();
+                host_slabs[v].pop_back();
+                if (hs.raw_k) cudaFreeHost(hs.raw_k);
+                if (hs.raw_v) cudaFreeHost(hs.raw_v);
+                if (hs.raw_ksc) cudaFreeHost(hs.raw_ksc);
+                if (hs.raw_vsc) cudaFreeHost(hs.raw_vsc);
+            }
+            return false;
+        }
+        const int base_id = kv_dev_blocks + s_idx * kInkSlabBlocks;
+        blk_ref.resize((size_t)(base_id + kInkSlabBlocks), 0);
+        for (int b = kInkSlabBlocks - 1; b >= 0; --b) free_host_blks.push_back(base_id + b);
+        ++kv_host_slabs;
+        std::fprintf(stderr, "[InkPagedKV] Allocated on-demand host slab #%d (+%d tokens, %.2f GiB pinned RAM; pool total = %d VRAM + %d host tokens)\n",
+                     kv_host_slabs, kInkSlabBlocks * kInkKvBlock, (double)slab_bytes / 1073741824.0,
+                     kv_dev_blocks * kInkKvBlock, kv_host_slabs * kInkSlabBlocks * kInkKvBlock);
+        return true;
+    }
+
+    bool paged_demote_one_idle_slot() {
+        if (!paged_kv_active || active_slots_mask == 0ull || kv_dev_blocks <= 0) return false;
+        // Find an idle slot holding private (blk_ref == 1) VRAM blocks and demote them losslessly to Host RAM!
+        int best_slot = -1, best_cnt = 0;
+        for (int s = 0; s < max_slots && s < 64; ++s) {
+            if (active_slots_mask & (1ull << s)) continue;
+            int cnt = 0;
+            const int32_t* pt = h_page_table.data() + (size_t)s * kv_page_stride;
+            for (int b = 0; b < kv_page_stride; ++b) {
+                const int32_t p = pt[b];
+                if (p >= 0 && p < kv_dev_blocks && blk_ref[p] == 1) ++cnt;
+            }
+            if (cnt > best_cnt) { best_cnt = cnt; best_slot = s; }
+        }
+        if (best_slot < 0 || best_cnt <= 0) return false;
+
+        int32_t* pt = h_page_table.data() + (size_t)best_slot * kv_page_stride;
+        int dirty_lo = kv_page_stride, dirty_hi = -1, moved = 0;
+        for (int b = 0; b < kv_page_stride; ++b) {
+            const int32_t vp = pt[b];
+            if (vp < 0 || vp >= kv_dev_blocks || blk_ref[vp] != 1) continue;
+            if (free_host_blks.empty() && !paged_alloc_host_slab()) break;
+            const int32_t hp = free_host_blks.back();
+            free_host_blks.pop_back();
+            blk_ref[hp] = 1;
+            paged_copy_block_all8(vp, hp);
+            pt[b] = hp;
+            blk_ref[vp] = 0;
+            free_dev_blks.push_back(vp);
+            if (b < dirty_lo) dirty_lo = b;
+            if (b > dirty_hi) dirty_hi = b;
+            ++moved;
+        }
+        if (dirty_lo <= dirty_hi) paged_upload_slot_range(best_slot, dirty_lo, dirty_hi);
+        return moved > 0;
+    }
+
+    int paged_alloc_block() {
+        if (!free_dev_blks.empty()) {
+            int id = free_dev_blks.back();
+            free_dev_blks.pop_back();
+            blk_ref[id] = 1;
+            return id;
+        }
+        if (paged_demote_one_idle_slot() && !free_dev_blks.empty()) {
+            int id = free_dev_blks.back();
+            free_dev_blks.pop_back();
+            blk_ref[id] = 1;
+            return id;
+        }
+        if (free_host_blks.empty() && !paged_alloc_host_slab()) return -1;
+        int id = free_host_blks.back();
+        free_host_blks.pop_back();
+        blk_ref[id] = 1;
+        return id;
+    }
+
+    void paged_decref_block(int phys) {
+        if (phys < 0 || phys >= (int)blk_ref.size()) return;
+        if (blk_ref[phys] > 0 && --blk_ref[phys] == 0) {
+            if (phys < kv_dev_blocks) free_dev_blks.push_back(phys);
+            else                      free_host_blks.push_back(phys);
+        }
+    }
+
+    void paged_copy_block_all8(int src_phys, int dst_phys) {
+        const size_t blk_el = (size_t)kInkKvBlock * kInkKVHeads * kInkHeadDim;
+        const size_t blk_sc = (size_t)kInkKvBlock * kInkKVHeads;
+        auto blk_ptrs = [&](int v, int phys, void*& pk, void*& pv, float*& pksc, float*& pvsc) {
+            if (phys < kv_dev_blocks) {
+                const size_t off = (size_t)phys * blk_el;
+                if (kv_dtype == InkKvDtype::FP16) { pk = kv_desc[v].k_f16 + off; pv = kv_desc[v].v_f16 + off; pksc = pvsc = nullptr; }
+                else {
+                    pk = kv_desc[v].k_f8 + off;
+                    pv = kv_desc[v].v_f8 + ((kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : off);
+                    pksc = kv_desc[v].k_sc + (size_t)phys * blk_sc;
+                    pvsc = kv_desc[v].v_sc + (size_t)phys * blk_sc;
+                }
+            } else {
+                const int hi = phys - kv_dev_blocks;
+                const int s = hi >> kInkSlabShift;
+                const int bo = hi & kInkSlabMask;
+                const size_t off = (size_t)bo * blk_el;
+                const auto& hs = host_slabs[v][s];
+                if (kv_dtype == InkKvDtype::FP16) {
+                    pk = reinterpret_cast<__half*>(hs.dev_k) + off;
+                    pv = reinterpret_cast<__half*>(hs.dev_v) + off;
+                    pksc = pvsc = nullptr;
+                } else {
+                    pk = reinterpret_cast<uint8_t*>(hs.dev_k) + off;
+                    pv = reinterpret_cast<uint8_t*>(hs.dev_v) + ((kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : off);
+                    pksc = hs.dev_ksc + (size_t)bo * blk_sc;
+                    pvsc = hs.dev_vsc + (size_t)bo * blk_sc;
+                }
+            }
+        };
+        for (int v = 0; v < kInkVisits; ++v) {
+            if (kv_desc[v].is_swa) continue;
+            void *sk, *sv, *dk, *dv;
+            float *sks, *svs, *dks, *dvs;
+            blk_ptrs(v, src_phys, sk, sv, sks, svs);
+            blk_ptrs(v, dst_phys, dk, dv, dks, dvs);
+            if (kv_dtype == InkKvDtype::FP16) {
+                INK_CK(cudaMemcpyAsync(dk, sk, blk_el * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+                INK_CK(cudaMemcpyAsync(dv, sv, blk_el * sizeof(__half), cudaMemcpyDeviceToDevice, st));
+            } else {
+                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (blk_el / 2u) : blk_el;
+                INK_CK(cudaMemcpyAsync(dk, sk, blk_el, cudaMemcpyDeviceToDevice, st));
+                INK_CK(cudaMemcpyAsync(dv, sv, vb, cudaMemcpyDeviceToDevice, st));
+                INK_CK(cudaMemcpyAsync(dks, sks, blk_sc * sizeof(float), cudaMemcpyDeviceToDevice, st));
+                INK_CK(cudaMemcpyAsync(dvs, svs, blk_sc * sizeof(float), cudaMemcpyDeviceToDevice, st));
+            }
+        }
+    }
+
+    void paged_upload_slot_range(int slot, int b_lo, int b_hi) {
+        if (!paged_kv_active || b_lo > b_hi) return;
+        const size_t off = (size_t)slot * kv_page_stride + b_lo;
+        INK_CK(cudaMemcpyAsync(d_page_table + off, h_page_table.data() + off,
+                               (size_t)(b_hi - b_lo + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, st));
+    }
+
+    bool paged_ensure_slot_pos(int slot, int pos_lo, int pos_hi) {
+        if (!paged_kv_active) return true;
+        if (pos_lo < 0 || pos_hi >= max_ctx) return false;
+        const int b_lo = pos_lo >> kInkKvBlockShift;
+        const int b_hi = pos_hi >> kInkKvBlockShift;
+        int dirty_lo = b_hi + 1, dirty_hi = -1;
+        for (int b = b_lo; b <= b_hi; ++b) {
+            int32_t& entry = h_page_table[(size_t)slot * kv_page_stride + b];
+            if (entry < 0) {
+                int np = paged_alloc_block();
+                if (np < 0) return false;
+                entry = np;
+                if (b < dirty_lo) dirty_lo = b;
+                if (b > dirty_hi) dirty_hi = b;
+            } else if (blk_ref[entry] > 1) {
+                // Copy-on-Write: slot is writing into a shared prefix block!
+                int np = paged_alloc_block();
+                if (np < 0) return false;
+                paged_copy_block_all8(entry, np);
+                paged_decref_block(entry);
+                entry = np;
+                if (b < dirty_lo) dirty_lo = b;
+                if (b > dirty_hi) dirty_hi = b;
+            }
+        }
+        if (dirty_lo <= dirty_hi) paged_upload_slot_range(slot, dirty_lo, dirty_hi);
+        return true;
+    }
+
+    void paged_release_slot(int slot, int from_blk = 0) {
+        if (!paged_kv_active || slot < 0 || slot >= max_slots) return;
+        int dirty_lo = kv_page_stride, dirty_hi = -1;
+        for (int b = from_blk; b < kv_page_stride; ++b) {
+            int32_t& entry = h_page_table[(size_t)slot * kv_page_stride + b];
+            if (entry >= 0) {
+                paged_decref_block(entry);
+                entry = -1;
+                if (b < dirty_lo) dirty_lo = b;
+                if (b > dirty_hi) dirty_hi = b;
+            }
+        }
+        if (dirty_lo <= dirty_hi) paged_upload_slot_range(slot, dirty_lo, dirty_hi);
+    }
+
+    void paged_retain_blocks(int slot, int seq_len, std::vector<int32_t>& out_blocks) {
+        for (int32_t p : out_blocks) paged_decref_block(p);
+        out_blocks.clear();
+        if (!paged_kv_active || seq_len <= 0) return;
+        const int nb = (seq_len + kInkKvBlock - 1) >> kInkKvBlockShift;
+        out_blocks.resize((size_t)nb, -1);
+        for (int b = 0; b < nb; ++b) {
+            int32_t p = h_page_table[(size_t)slot * kv_page_stride + b];
+            out_blocks[b] = p;
+            if (p >= 0 && p < (int)blk_ref.size()) ++blk_ref[p];
+        }
+    }
+
+    bool paged_clone_blocks(int dst_slot, const std::vector<int32_t>& src_blocks) {
+        if (!paged_kv_active || dst_slot < 0 || dst_slot >= max_slots) return false;
+        paged_release_slot(dst_slot, 0);
+        const int nb = std::min((int)src_blocks.size(), kv_page_stride);
+        for (int b = 0; b < nb; ++b) {
+            int32_t p = src_blocks[b];
+            if (p < 0) { paged_release_slot(dst_slot, 0); return false; }
+            ++blk_ref[p];
+            h_page_table[(size_t)dst_slot * kv_page_stride + b] = p;
+        }
+        if (nb > 0) paged_upload_slot_range(dst_slot, 0, nb - 1);
+        return true;
+    }
     // ShortConv state pool: [48 visits] x 4 states (k [1024], v [1024], attn [2304], mlp [2304]) -> 1 contiguous buffer!
     // Layout: visit -> [max_slots, 3, 6656] F32 (or 256 MB for 64 slots)
     float* d_sconv_pool[kInkVisits] = {};
@@ -2215,7 +2570,9 @@ struct InkCudaRunner {
         max_ctx = std::max(64, ctx);
         kv_offload_mode = kv_offload;
         max_batch = std::max(chunk, std::max(16, max_slots));
-        swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + std::max(max_batch, 64));
+        // Slim SWA ring: 1024 + 32 = 1056 tokens per slot (saves ~240 MiB at 16 slots -> +7.5K VRAM global KV!);
+        // M >= 128 prefill reads new tokens directly from d_k/d_v and writes tail after attention!
+        swa_ring = kInkSwaWin + 32;
         kv_dtype = kvd;
         cur_stage = 0;
         cur_moe_ws = &moe_ws;
@@ -2243,14 +2600,8 @@ struct InkCudaRunner {
             INK_CK(ink_cuda_mem_info(&vfree, &vtot, m.primary_gpu));
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree : 16;
             max_batch = std::max(max_batch, tree_cap);
-            if (vfree < (2200ull << 20) && max_batch > 512) {
-                max_batch = 512;
-                swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
-            }
-            if (vfree < (1200ull << 20) && max_batch > 256) {
-                max_batch = 256;
-                swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
-            }
+            if (vfree < (2200ull << 20) && max_batch > 512) max_batch = 512;
+            if (vfree < (1200ull << 20) && max_batch > 256) max_batch = 256;
             const size_t per_visit_pos = kv_bytes_per_visit_pos(kv_dtype);
             int n_swa_g0 = 0, n_glob_g0 = 0;
             for (int v = 0; v < kInkVisits; ++v) {
@@ -2281,7 +2632,41 @@ struct InkCudaRunner {
                 ? (int)std::min<size_t>((size_t)max_ctx, ((size_t)(host_avail - host_os_res) / std::max<size_t>(1, per_pos_all_glob)) & ~(size_t)63)
                 : max_ctx;
 
-            if (kv_offload_mode == 1 && host_fit_ctx >= 256) {
+            const char* pkv_env = std::getenv("STRATA_INK_PAGED_KV");
+            const bool pkv_off  = (pkv_env != nullptr && pkv_env[0] == 0);
+            const bool pkv_force = (pkv_env != nullptr && pkv_env[0] == 1);
+            const bool use_paged_kv = !m.ls_active && !pkv_off && (pkv_force || max_ctx > 32768 || max_slots >= 2);
+
+            if (use_paged_kv) {
+                paged_kv_active = true;
+                kv_page_stride  = (max_ctx + kInkKvBlock - 1) >> kInkKvBlockShift;
+                // Reserve workspace delta for max_batch > 512 + 320 MiB headroom for prefill attn & CUDA graphs
+                const size_t extra_ws = ((max_batch > 512) ? ((size_t)(max_batch - 512) * 512ull * 1024u) : 0u) + (320ull << 20);
+                const size_t avail_p = (avail_glob > extra_ws) ? (avail_glob - extra_ws) : 0u;
+                const size_t blk_bytes_all8 = (size_t)8 * kInkKvBlock * per_visit_pos;
+                const int max_total_blks = max_slots * kv_page_stride;
+                kv_dev_blocks = (kv_offload_mode == 1) ? 0
+                    : std::min(max_total_blks, (int)(avail_p / std::max<size_t>(1, blk_bytes_all8)));
+                kv_dev_ctx   = kv_dev_blocks * kInkKvBlock;
+                kv_host_ctx  = max_ctx;
+                kv_alloc_ctx = max_ctx;
+                const size_t pt_n = (size_t)max_slots * kv_page_stride;
+                h_page_table.assign(pt_n, -1);
+                d_page_table = dalloc<int32_t>(pt_n);
+                INK_CK(cudaMemcpy(d_page_table, h_page_table.data(), pt_n * sizeof(int32_t), cudaMemcpyHostToDevice));
+                blk_ref.assign((size_t)kv_dev_blocks, 0);
+                free_dev_blks.clear();
+                free_dev_blks.reserve((size_t)kv_dev_blocks);
+                for (int b = kv_dev_blocks - 1; b >= 0; --b) free_dev_blks.push_back(b);
+                free_host_blks.clear();
+                kv_host_slabs = 0;
+                std::fprintf(stderr, "[InkPagedKV] Unified Paged Global KV ON (kv_fmt=%d, max_ctx=%d, slots=%d, max_batch=%d): "
+                             "shared VRAM pool = %d blocks (%d tokens, %.2f GiB) + on-demand 64K-token host RAM slabs (0 GiB at startup, %.1f GiB RAM avail)\n",
+                             (int)kv_dtype, max_ctx, max_slots, max_batch,
+                             kv_dev_blocks, kv_dev_blocks * kInkKvBlock,
+                             (double)((size_t)kv_dev_blocks * blk_bytes_all8) / 1073741824.0,
+                             (double)host_avail / 1073741824.0);
+            } else if (kv_offload_mode == 1 && host_fit_ctx >= 256) {
                 if (host_fit_ctx < max_ctx) max_ctx = std::max(256, host_fit_ctx);
                 kv_dev_ctx = 0;
                 kv_host_ctx = max_ctx;
@@ -2325,14 +2710,47 @@ struct InkCudaRunner {
             const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
             INK_CK(cudaSetDevice(dev));
             const bool swa = m.man.c.is_swa[ip] != 0;
-            const int dcap = swa ? swa_ring : kv_dev_ctx;
-            const int hcap = swa ? 0 : kv_host_ctx;
+            const bool paged_g = (!swa && paged_kv_active);
+            const int dcap = swa ? swa_ring : (paged_g ? 0 : kv_dev_ctx);
+            const int hcap = swa ? 0 : (paged_g ? 0 : kv_host_ctx);
             kv_desc[v] = {};
-            kv_desc[v].cap_pos  = dcap + hcap;
+            kv_desc[v].cap_pos  = paged_g ? max_ctx : (dcap + hcap);
             kv_desc[v].dev_cap  = dcap;
             kv_desc[v].host_cap = hcap;
             kv_desc[v].is_swa   = swa;
             kv_desc[v].kv_fmt   = (uint8_t)kv_dtype;
+            if (paged_g) {
+                kv_desc[v].page_table  = d_page_table;
+                kv_desc[v].page_stride = kv_page_stride;
+                kv_desc[v].dev_blocks  = kv_dev_blocks;
+                d_h_slabs_k[v] = dalloc<void*>(kInkMaxHostSlabs);
+                d_h_slabs_v[v] = dalloc<void*>(kInkMaxHostSlabs);
+                INK_CK(cudaMemset(d_h_slabs_k[v], 0, kInkMaxHostSlabs * sizeof(void*)));
+                INK_CK(cudaMemset(d_h_slabs_v[v], 0, kInkMaxHostSlabs * sizeof(void*)));
+                kv_desc[v].h_slabs_k = d_h_slabs_k[v];
+                kv_desc[v].h_slabs_v = d_h_slabs_v[v];
+                if (kv_dtype != InkKvDtype::FP16) {
+                    d_h_slabs_ksc[v] = dalloc<float*>(kInkMaxHostSlabs);
+                    d_h_slabs_vsc[v] = dalloc<float*>(kInkMaxHostSlabs);
+                    INK_CK(cudaMemset(d_h_slabs_ksc[v], 0, kInkMaxHostSlabs * sizeof(float*)));
+                    INK_CK(cudaMemset(d_h_slabs_vsc[v], 0, kInkMaxHostSlabs * sizeof(float*)));
+                    kv_desc[v].h_slabs_ksc = d_h_slabs_ksc[v];
+                    kv_desc[v].h_slabs_vsc = d_h_slabs_vsc[v];
+                }
+                if (kv_dev_blocks > 0) {
+                    const size_t elems = (size_t)kv_dev_blocks * kInkKvBlock * kInkKVHeads * kInkHeadDim;
+                    const size_t sc_n  = (size_t)kv_dev_blocks * kInkKvBlock * kInkKVHeads;
+                    if (kv_dtype == InkKvDtype::FP16) {
+                        kv_desc[v].k_f16 = dalloc<__half>(elems);
+                        kv_desc[v].v_f16 = dalloc<__half>(elems);
+                    } else {
+                        kv_desc[v].k_f8 = dalloc<uint8_t>(elems);
+                        kv_desc[v].v_f8 = dalloc<uint8_t>((kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : elems);
+                        kv_desc[v].k_sc = dalloc<float>(sc_n);
+                        kv_desc[v].v_sc = dalloc<float>(sc_n);
+                    }
+                }
+            }
             if (dcap > 0) {
                 const size_t elems = (size_t)max_slots * dcap * kInkKVHeads * kInkHeadDim;
                 if (kv_dtype == InkKvDtype::FP16) {
@@ -2771,6 +3189,7 @@ struct InkCudaRunner {
                 INK_CK(cudaMemsetAsync(p, 0, (size_t)3 * c_len[st_i] * sizeof(float), vst));
             }
         }
+        if (paged_kv_active) paged_release_slot(slot, 0);
         if (m.ls_active) cudaSetDevice(m.stage_gpu[cur_stage]);
     }
 
@@ -3216,9 +3635,10 @@ struct InkCudaRunner {
         const size_t kv_b = (size_t)kInkHeads * kInkPfKvTile * kInkHeadDim * sizeof(__nv_bfloat16);
         const size_t s_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(float);
         const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(__nv_bfloat16);
-        const size_t o_b  = (size_t)kInkHeads * Q_CH * kInkHeadDim * sizeof(float);
-        const size_t ml_b = (size_t)kInkHeads * Q_CH * sizeof(float);
-        const size_t need = q_b + 2 * kv_b + s_b + p_b + 2 * o_b + 2 * ml_b;
+        const size_t o_acc_b  = (size_t)kInkHeads * max_batch * kInkHeadDim * sizeof(float);
+        const size_t o_tile_b = (size_t)kInkHeads * Q_CH * kInkHeadDim * sizeof(float);
+        const size_t ml_b     = (size_t)kInkHeads * max_batch * sizeof(float);
+        const size_t need = q_b + 2 * kv_b + s_b + p_b + o_acc_b + o_tile_b + 2 * ml_b;
         size_t vf = 0, vt = 0;
         const int dev = m.ls_active ? m.stage_gpu[cur_stage] : m.primary_gpu;
         if (ink_cuda_mem_info(&vf, &vt, dev) != cudaSuccess || vf < need + (192ull << 20)) return false;
@@ -3227,8 +3647,8 @@ struct InkCudaRunner {
             cudaMalloc(&d_pf_v, kv_b) != cudaSuccess ||
             cudaMalloc(&d_pf_s, s_b) != cudaSuccess ||
             cudaMalloc(&d_pf_p, p_b) != cudaSuccess ||
-            cudaMalloc(&d_pf_o, o_b) != cudaSuccess ||
-            cudaMalloc(&d_pf_ot, o_b) != cudaSuccess ||
+            cudaMalloc(&d_pf_o, o_acc_b) != cudaSuccess ||
+            cudaMalloc(&d_pf_ot, o_tile_b) != cudaSuccess ||
             cudaMalloc(&d_pf_m, ml_b) != cudaSuccess ||
             cudaMalloc(&d_pf_l, ml_b) != cudaSuccess) {
             cudaGetLastError();
@@ -3409,7 +3829,10 @@ struct InkCudaRunner {
                 d_q, p_qc, qc_elems,
                 d_k, d_v, d_r, p_rc, rc_elems,
                 d_pos, !is_swa, M);
-            k_ink_kv_write<<<dim3(kInkKVHeads, M), 128, 0, st>>>(d_k, d_v, nullptr, slot0, d_pos, kv_desc[visit], M);
+            // For SWA prefill M >= 128, defer ring write until after attention so slim swa_ring=1152 never overwrites prior window!
+            if (!(is_swa && mode == 0 && M >= 32)) {
+                k_ink_kv_write<<<dim3(kInkKVHeads, M), 128, 0, st>>>(d_k, d_v, nullptr, slot0, d_pos, kv_desc[visit], M);
+            }
         }
 
         // 7. RelPos Table + Fused Sink Flash-GQA (Adaptive Split-K 16/32 for M==1 (#6591), O(1)-VRAM KV-Tiled TC for prefill M>=128 (#6609/#6605)!)
@@ -3418,20 +3841,54 @@ struct InkCudaRunner {
             const int cur_cc = m.ls_active ? m.stage_cc[cur_stage] : m.sm_cc;
             dim3 gr(kInkHeads, M);
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
+            const bool swa_deferred = (is_swa && mode == 0 && M >= 32);
             if (M <= 16 || mode == 2) {
-                // #6671: a verify tree uses the one-token step's split count, so row m is the value the step at that position gives (the key split, the
-                // warp walk and the merge are the same; only the count differed: 8 for M > 1 against 16 / 32 for M == 1)
-                const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
-                dim3 gsp(kInkKVHeads, n_sp, M);
-                k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                    d_q, d_rel_table, d_sinks,
-                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                    (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
-                    (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
-                    p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
-                k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
-            } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
-                // O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Attention (fixed <= ~114 MiB even at 256K+ ctx!)
+                if (!is_swa && mode != 2 && step_cpu_host_kv) {
+                    // CPU-GPU Hybrid Split-K Attention: GPU computes VRAM blocks (0..n_sp_gpu-1) while
+                    // 16-core AVX2+FMA+F16C EPYC CPU computes Host RAM slabs at 42.5 GB/s -> merged in split n_sp_gpu!
+                    const int n_sp_tot = (M == 1) ? kInkAttnMaxSplits : kInkAttnSplits;
+                    const int n_sp_gpu = n_sp_tot - 1;
+                    INK_CK(cudaMemcpyAsync(h_cpu_q_pin, d_q, (size_t)M * kInkHeads * kInkHeadDim * sizeof(float), cudaMemcpyDeviceToHost, st));
+                    if (step_cpu_need_rt) {
+                        INK_CK(cudaMemcpyAsync(h_cpu_rt_pin, d_rel_table, (size_t)M * kInkHeads * (kInkRelExtent + 1) * sizeof(float), cudaMemcpyDeviceToHost, st));
+                    }
+                    INK_CK(cudaStreamSynchronize(st));
+
+                    // Launch GPU VRAM-only Split-K asynchronously while CPU scans DDR4 host slabs!
+                    dim3 gsp(kInkKVHeads, n_sp_gpu, M);
+                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks,
+                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                        nullptr, nullptr, nullptr, nullptr,
+                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_gpu, n_sp_tot, 1);
+
+                    const int ns = (int)host_slabs[visit].size();
+                    const void* rk[kInkMaxHostSlabs];
+                    const void* rv[kInkMaxHostSlabs];
+                    for (int si = 0; si < ns; ++si) {
+                        rk[si] = host_slabs[visit][si].raw_k;
+                        rv[si] = host_slabs[visit][si].raw_v;
+                    }
+                    ink_host_kv_attn_fp16(
+                        h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
+                        rk, rv, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+
+                    INK_CK(cudaMemcpyAsync(d_cpu_split, h_cpu_split_pin, (size_t)M * kInkHeads * 130 * sizeof(float), cudaMemcpyHostToDevice, st));
+                    k_ink_attn_inject_split<<<dim3(kInkHeads, M), 128, 0, st>>>(
+                        d_cpu_split, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_tot, n_sp_gpu);
+                    k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp_tot);
+                } else {
+                    const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
+                    dim3 gsp(kInkKVHeads, n_sp, M);
+                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks,
+                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                        (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                        (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                    k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
+                }
+            } else if (mode == 0 && M >= 32 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
                 const bool use_fp16_pf = (cur_cc < 80);
                 const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;
                 const cublasGemmAlgo_t pf_algo = (cur_cc >= 70) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
@@ -3443,10 +3900,12 @@ struct InkCudaRunner {
                 constexpr int Q_CH = 256;
                 const float sc_qk = 0.08838834764831845f;
                 const float one = 1.0f, zero = 0.0f;
+                const float* ck_ptr = swa_deferred ? d_k : nullptr;
+                const float* cv_ptr = swa_deferred ? d_v : nullptr;
 
                 if (K_len <= kInkPfKvTile) {
-                    if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
-                    else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+                    if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
+                    else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
                     for (int q0 = 0; q0 < M; q0 += Q_CH) {
                         const int C = std::min(Q_CH, M - q0);
                         const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
@@ -3476,19 +3935,58 @@ struct InkCudaRunner {
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
                         k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(d_pf_o, d_gate_attn, d_attn_out, q0, C);
                     }
+                } else if (!is_swa) {
+                    // KT-OUTER Global Prefill Attention: packs each 2048-token KV tile ONCE for all M queries (8x less VRAM/PCIe KV traffic!)
+                    float* d_alpha_tmp = d_ctrl_gain;
+                    k_ink_pf_online_init<<<dim3(kInkHeads, M), 128, 0, st>>>(d_sinks, d_pf_m, d_pf_l, d_pf_o, 0, M);
+                    const int k_end_all = p0_val + M;
+                    for (int kt = k_start; kt < k_end_all; kt += kInkPfKvTile) {
+                        const int K_t = std::min(kInkPfKvTile, k_end_all - kt);
+                        if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
+                        else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
+                        for (int q0 = 0; q0 < M; q0 += Q_CH) {
+                            const int C = std::min(Q_CH, M - q0);
+                            const int k_sub_end = p0_val + q0 + C;
+                            if (kt >= k_sub_end) continue;
+                            const int K_sub = std::min(K_t, k_sub_end - kt);
+                            const bool is_last = (kt + K_t >= k_sub_end);
+                            INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
+                                cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                K_sub, C, kInkHeadDim, &sc_qk,
+                                d_pf_k, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
+                                d_pf_q + (size_t)q0 * kInkHeadDim, pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
+                                &zero, d_pf_s, CUDA_R_32F, K_sub, (long long)C * K_sub,
+                                kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                            if (use_fp16_pf) {
+                                k_ink_pf_softmax_tile_online<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_sub, p0_val, false, M);
+                            } else {
+                                k_ink_pf_softmax_tile_online<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
+                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_sub, p0_val, false, M);
+                            }
+                            INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
+                                cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                kInkHeadDim, C, K_sub, &one,
+                                d_pf_v, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
+                                d_pf_p, pf_dt, K_sub, (long long)C * K_sub,
+                                &zero, d_pf_ot, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
+                                kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                            k_ink_pf_accum_tile<<<dim3(kInkHeads, C), 128, 0, st>>>(
+                                d_pf_ot, d_alpha_tmp, d_pf_l, d_pf_o, d_gate_attn, d_attn_out, q0, C, is_last, M);
+                        }
+                    }
                 } else {
-                    // Long-context KV-Tiled Online-Softmax TC Attention (K_len > 2048 -> O(1) 114 MiB VRAM forever!)
-                    float* d_alpha_tmp = d_ctrl_gain;  // [max_batch * 2304] >> 24 * 256 floats!
+                    float* d_alpha_tmp = d_ctrl_gain;
                     for (int q0 = 0; q0 < M; q0 += Q_CH) {
                         const int C = std::min(Q_CH, M - q0);
-                        const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
+                        const int k_sub_beg = std::max(k_start, p0_val + q0 - kInkSwaWin + 1);
                         const int k_sub_end = p0_val + q0 + C;
                         k_ink_pf_online_init<<<dim3(kInkHeads, C), 128, 0, st>>>(d_sinks, d_pf_m, d_pf_l, d_pf_o, q0, C);
                         for (int kt = k_sub_beg; kt < k_sub_end; kt += kInkPfKvTile) {
                             const int K_t = std::min(kInkPfKvTile, k_sub_end - kt);
                             const bool is_last = (kt + K_t >= k_sub_end);
-                            if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
-                            else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
+                            if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
+                            else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v, ck_ptr, cv_ptr, p0_val);
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                                 K_t, C, kInkHeadDim, &sc_qk,
@@ -3498,10 +3996,10 @@ struct InkCudaRunner {
                                 kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
                             if (use_fp16_pf) {
                                 k_ink_pf_softmax_tile_online<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, is_swa);
+                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, true);
                             } else {
                                 k_ink_pf_softmax_tile_online<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, is_swa);
+                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, true);
                             }
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -3516,11 +4014,21 @@ struct InkCudaRunner {
                     }
                 }
             } else {
+                if (swa_deferred) {
+                    k_ink_kv_write<<<dim3(kInkKVHeads, M), 128, 0, st>>>(d_k, d_v, nullptr, slot0, d_pos, kv_desc[visit], M);
+                }
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks, d_gate_attn,
                     kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
                     d_attn_out, M);
+            }
+            if (swa_deferred && (cur_cc >= 70 || cur_cc == 60)) {
+                const int tail_m = std::min(M, kInkSwaWin);
+                const int m_off  = M - tail_m;
+                k_ink_kv_write<<<dim3(kInkKVHeads, tail_m), 128, 0, st>>>(
+                    d_k + (size_t)m_off * kInkKVDim, d_v + (size_t)m_off * kInkKVDim,
+                    nullptr, slot0, d_pos + m_off, kv_desc[visit], tail_m);
             }
         }
         prof_mark_end(3); prof_mark_start();
@@ -3783,7 +4291,8 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_tok_ids, slot_buf, (size_t)M * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, h_pos, (size_t)M * 4, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && !m.ls_active && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0 && !m.hybrid.needs_eager()) {
+        const bool cpu_hk = (M <= kCpuHostMaxM) ? prepare_cpu_host_kv_plan(nullptr, slot0, h_pos, M) : (step_cpu_host_kv = false, false);
+        if (use_cuda_graph && !cpu_hk && !m.ls_active && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0 && !m.hybrid.needs_eager()) {
             GraphKey key{M, 0, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -3954,7 +4463,8 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && !m.ls_active && B <= 64 && (m.n_host_experts == 0 || (B == 1 && !m.hybrid.needs_eager()))) {
+        const bool cpu_hk = (B <= kCpuHostMaxM) ? prepare_cpu_host_kv_plan(slot_ids, 0, pos_arr, B) : (step_cpu_host_kv = false, false);
+        if (use_cuda_graph && !cpu_hk && !m.ls_active && B <= 64 && (m.n_host_experts == 0 || (B == 1 && !m.hybrid.needs_eager()))) {
             GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -4118,9 +4628,27 @@ struct InkCudaRunner {
             if (kv_desc[v].k_sc)  { cudaFree(kv_desc[v].k_sc);  kv_desc[v].k_sc = nullptr; }
             if (kv_desc[v].v_sc)  { cudaFree(kv_desc[v].v_sc);  kv_desc[v].v_sc = nullptr; }
             free_host_kv_visit(v);
+            for (auto& hs : host_slabs[v]) {
+                if (hs.raw_k) cudaFreeHost(hs.raw_k);
+                if (hs.raw_v) cudaFreeHost(hs.raw_v);
+                if (hs.raw_ksc) cudaFreeHost(hs.raw_ksc);
+                if (hs.raw_vsc) cudaFreeHost(hs.raw_vsc);
+            }
+            host_slabs[v].clear();
+            if (d_h_slabs_k[v])   { cudaFree(d_h_slabs_k[v]);   d_h_slabs_k[v] = nullptr; }
+            if (d_h_slabs_v[v])   { cudaFree(d_h_slabs_v[v]);   d_h_slabs_v[v] = nullptr; }
+            if (d_h_slabs_ksc[v]) { cudaFree(d_h_slabs_ksc[v]); d_h_slabs_ksc[v] = nullptr; }
+            if (d_h_slabs_vsc[v]) { cudaFree(d_h_slabs_vsc[v]); d_h_slabs_vsc[v] = nullptr; }
             if (d_sconv_pool[v])  { cudaFree(d_sconv_pool[v]);  d_sconv_pool[v] = nullptr; }
         }
         cudaSetDevice(m.primary_gpu);
+        if (d_page_table)    { cudaFree(d_page_table); d_page_table = nullptr; }
+        if (d_cpu_split)     { cudaFree(d_cpu_split); d_cpu_split = nullptr; }
+        if (h_cpu_q_pin)     { cudaFreeHost(h_cpu_q_pin); h_cpu_q_pin = nullptr; }
+        if (h_cpu_rt_pin)    { cudaFreeHost(h_cpu_rt_pin); h_cpu_rt_pin = nullptr; }
+        if (h_cpu_split_pin) { cudaFreeHost(h_cpu_split_pin); h_cpu_split_pin = nullptr; }
+        h_page_table.clear(); blk_ref.clear(); free_dev_blks.clear(); free_host_blks.clear();
+        paged_kv_active = false; kv_host_slabs = 0;
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_cur); fr(d_res); fr(d_prelude); fr(d_bank_out);
         for (int i = 0; i < 8; ++i) fr(d_blocks[i]);

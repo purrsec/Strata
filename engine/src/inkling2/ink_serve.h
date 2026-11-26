@@ -568,6 +568,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     proto("READY %d stop hold holdb", eff_max_ctx);
 
     std::vector<ActiveReq> reqs(P);
+    std::vector<int32_t> global_shared_prefix;
     std::unordered_map<std::string, int> req_id_to_slot;
     ServeInput in;
     in.start();
@@ -692,11 +693,22 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 std::equal(rq.shared_prefix.begin(), rq.shared_prefix.end(), rq.prompt_ids.begin())) {
                 shared_match = pg.pin;
             }
+            int global_match = 0;
+            if (!global_shared_prefix.empty() && static_cast<int>(global_shared_prefix.size()) < rq.prompt_len &&
+                (pg.pin <= 0 || static_cast<int>(global_shared_prefix.size()) == pg.pin) &&
+                std::equal(global_shared_prefix.begin(), global_shared_prefix.end(), rq.prompt_ids.begin())) {
+                global_match = static_cast<int>(global_shared_prefix.size());
+            }
             if (shared_match > full_match && shared_match > ckpt_match &&
                 backend.restore_shared_checkpoint(rq.slot, shared_match)) {
                 reuse = shared_match;
                 rq.cached_prefix = rq.shared_prefix;
-                // The next branch overwrites global KV after the shared boundary.
+                rq.prompt_ckpt_prefix.clear();
+            } else if (global_match > full_match && global_match > ckpt_match && global_match > shared_match &&
+                       backend.clone_global_shared_prefix(rq.slot, global_match)) {
+                reuse = global_match;
+                rq.shared_prefix = global_shared_prefix;
+                rq.cached_prefix = global_shared_prefix;
                 rq.prompt_ckpt_prefix.clear();
             } else if (full_match > 0 && full_match >= ckpt_match) {
                 reuse = full_match;
@@ -707,6 +719,12 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                        backend.restore_shared_checkpoint(rq.slot, shared_match)) {
                 reuse = shared_match;
                 rq.cached_prefix = rq.shared_prefix;
+                rq.prompt_ckpt_prefix.clear();
+            } else if (global_match > 0 && global_match > full_match &&
+                       backend.clone_global_shared_prefix(rq.slot, global_match)) {
+                reuse = global_match;
+                rq.shared_prefix = global_shared_prefix;
+                rq.cached_prefix = global_shared_prefix;
                 rq.prompt_ckpt_prefix.clear();
             } else if (full_match > 0) {
                 reuse = full_match;
@@ -1010,6 +1028,37 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         std::vector<int> prefill_fed(P, 0);
         double t_step0 = now_s();
 
+        // Inform backend which slots are currently active so VRAM pool demotes only idle slots!
+        {
+            uint64_t amask = 0;
+            for (int s = 0; s < P && s < 64; ++s) if (reqs[s].active) amask |= (1ull << s);
+            backend.set_active_slots_mask(amask);
+        }
+
+        // Dynamic Leader-Follower Zero-Copy Clone: if a waiting follower slot at prefill_pos == 0 matches
+        // the newly-saved global_shared_prefix, clone it immediately instead of redundantly prefilling!
+        if (!global_shared_prefix.empty()) {
+            const int gsz = static_cast<int>(global_shared_prefix.size());
+            for (int s = 0; s < P; ++s) {
+                auto& rq = reqs[s];
+                if (!rq.active || rq.prefill_pos != 0 || rq.prompt_len <= gsz) continue;
+                if (!rq.img_embeds.empty()) continue;
+                if (rq.pin > 0 && rq.pin != gsz) continue;
+                if (std::equal(global_shared_prefix.begin(), global_shared_prefix.end(), rq.prompt_ids.begin())) {
+                    if (backend.clone_global_shared_prefix(rq.slot, gsz)) {
+                        rq.shared_prefix = global_shared_prefix;
+                        rq.cached_prefix = global_shared_prefix;
+                        rq.prompt_ckpt_prefix.clear();
+                        rq.reused_tokens = gsz;
+                        rq.prefill_pos = gsz;
+                        rq.cur_pos = gsz;
+                        rq.shared_pending = false;
+                        rq.ckpt_pending = (rq.prompt_len >= 16 && gsz < rq.prompt_len - 1);
+                    }
+                }
+            }
+        }
+
         // First schedule 1 decode token for every decoding slot (zero head-of-line blocking!)
         for (int s = 0; s < P; ++s) {
             auto& rq = reqs[s];
@@ -1022,40 +1071,51 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             logit_slots.push_back(s);
             --token_budget;
         }
-        // While some slot decodes, a prompt is read at most `prefill_cap` tokens per step: one step then costs the decode tokens plus
-        // that chunk, so the decoding slots keep their cadence while a long prompt is read (a 2048-token chunk was ~0.5 s per decode token).
+        // While some slot decodes, cap prefill chunk (default 1024 if unset) to balance decode cadence & TC efficiency
         if (prefill_cap > 0 && !logit_slots.empty()) token_budget = std::min(token_budget, prefill_cap);
 
-        // Then fill remaining budget with chunked-prefill tokens across prefilling slots (round-robin!)
+        // 1-Slot-Per-Chunk Full Tensor Core Prefill: instead of fragmenting 2048 into 8x256 (which reads expert weights
+        // and global KV 8x more often!), feed ONE slot at a time with full `token_budget`!
+        // Priority: (1) leader with shared_pending so followers can zero-copy clone it; (2) shortest remaining prefill
+        // so agents enter batched decode ASAP!
         if (token_budget > 0) {
-            std::vector<int> pf_slots;
-            for (int s = 0; s < P; ++s) if (reqs[s].active && reqs[s].prefill_pos < reqs[s].prompt_len) pf_slots.push_back(s);
-            if (!pf_slots.empty()) {
-                const int per_slot = std::max(1, token_budget / static_cast<int>(pf_slots.size()));
-                for (int s : pf_slots) {
-                    auto& rq = reqs[s];
-                    const int rem = rq.prompt_len - rq.prefill_pos;
-                    int take = std::min(rem, per_slot);
-                    // #6627: Pause 1 token before prompt_len so we save the exact prompt-end checkpoint at prompt_len - 1!
-                    if (rq.ckpt_pending && rq.prefill_pos < rq.prompt_len - 1 && rq.prefill_pos + take >= rq.prompt_len) {
-                        take = (rq.prompt_len - 1) - rq.prefill_pos;
-                    }
-                    if (rq.shared_pending && rq.prefill_pos < rq.pin) {
-                        take = std::min(take, rq.pin - rq.prefill_pos);
-                    }
-                    const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
-                    if (!rq.img_embeds.empty()) {
-                        merged_img_embeds.insert(merged_img_embeds.end(), rq.img_embeds.begin(), rq.img_embeds.end());
-                    }
-                    for (int k = 0; k < take; ++k) {
-                        const int p_i = rq.prefill_pos + k;
-                        const bool is_last = (p_i == rq.prompt_len - 1);
-                        int img_idx = (rq.prompt_img_idx[p_i] >= 0) ? (img_base + rq.prompt_img_idx[p_i]) : -1;
-                        batch.push(s, p_i, rq.prompt_ids[p_i], is_last, img_idx);
-                        if (is_last) logit_slots.push_back(s);
-                    }
-                    prefill_fed[s] = take;
+            int chosen = -1;
+            int best_rem = INT32_MAX;
+            bool best_leader = false;
+            for (int s = 0; s < P; ++s) {
+                auto& rq = reqs[s];
+                if (!rq.active || rq.prefill_pos >= rq.prompt_len) continue;
+                const bool is_leader = rq.shared_pending && rq.prefill_pos < rq.pin;
+                const int rem = rq.prompt_len - rq.prefill_pos;
+                if (chosen < 0 || (is_leader && !best_leader) ||
+                    (is_leader == best_leader && (is_leader ? (rq.prefill_pos > reqs[chosen].prefill_pos) : (rem < best_rem)))) {
+                    chosen = s;
+                    best_rem = rem;
+                    best_leader = is_leader;
                 }
+            }
+            if (chosen >= 0) {
+                auto& rq = reqs[chosen];
+                const int rem = rq.prompt_len - rq.prefill_pos;
+                int take = std::min(rem, token_budget);
+                if (rq.ckpt_pending && rq.prefill_pos < rq.prompt_len - 1 && rq.prefill_pos + take >= rq.prompt_len) {
+                    take = (rq.prompt_len - 1) - rq.prefill_pos;
+                }
+                if (rq.shared_pending && rq.prefill_pos < rq.pin) {
+                    take = std::min(take, rq.pin - rq.prefill_pos);
+                }
+                const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
+                if (!rq.img_embeds.empty()) {
+                    merged_img_embeds.insert(merged_img_embeds.end(), rq.img_embeds.begin(), rq.img_embeds.end());
+                }
+                for (int k = 0; k < take; ++k) {
+                    const int p_i = rq.prefill_pos + k;
+                    const bool is_last = (p_i == rq.prompt_len - 1);
+                    int img_idx = (rq.prompt_img_idx[p_i] >= 0) ? (img_base + rq.prompt_img_idx[p_i]) : -1;
+                    batch.push(chosen, p_i, rq.prompt_ids[p_i], is_last, img_idx);
+                    if (is_last) logit_slots.push_back(chosen);
+                }
+                prefill_fed[chosen] = take;
             }
         }
         if (!merged_img_embeds.empty()) batch.img_embeds = merged_img_embeds.data();
@@ -1114,6 +1174,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     rq.shared_prefix.clear();
                     if (backend.save_shared_checkpoint(rq.slot, rq.pin)) {
                         rq.shared_prefix.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.pin);
+                        global_shared_prefix = rq.shared_prefix;
                     }
                 }
                 if (rq.ckpt_pending && rq.prefill_pos == rq.prompt_len - 1) {

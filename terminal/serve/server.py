@@ -5840,7 +5840,8 @@ class Service:
                 except (TypeError, ValueError):
                     chunk = 0
                 n = req["strata_prefix"].get("tokens", 0)
-                n = (n // chunk) * chunk if chunk > 0 else 0
+                align = 256 if inkling_shared_ok else chunk
+                n = (n // align) * align if align > 0 else 0
                 req["strata_prefix"] = {"tokens": n} if n > 0 else {}
         if self.inkling:                       # the thinking level decides (a forced call skips the thinking)
             word, level = inkling_dialect.effort_of(kwargs)

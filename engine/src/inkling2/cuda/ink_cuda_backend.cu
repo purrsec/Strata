@@ -292,8 +292,9 @@ public:
         if (opts.chunk_auto && !model_.ls_active) {
             const char* auto_env = std::getenv("STRATA_INK_CHUNK_AUTO");
             if (!(auto_env && std::atoi(auto_env) == 0)) {
-                // the K/V still to be allocated for every slot to reach the context stays free of the chunk's working memory (kv offload on: it is host RAM)
-                const double kv_grow_mib = (kv_offload_mode == 1) ? 0.0
+                const char* pkv_e = std::getenv("STRATA_INK_PAGED_KV");
+                const bool pkv_will_on = !model_.ls_active && !(pkv_e && pkv_e[0] == 0) && ((pkv_e && pkv_e[0] == 1) || opts.max_ctx > 32768 || max_slots_ >= 2);
+                const double kv_grow_mib = (kv_offload_mode == 1 || pkv_will_on) ? 0.0
                     : (double)8 * max_slots_ * std::max(0, std::max(256, opts.max_ctx) - init_glob) * (double)per_visit_pos / 1048576.0;
                 chunk_try = std::max(chunk_try, strata::core::ink_auto_chunk(led_loaded, max_slots_, kv_grow_mib));
                 std::fprintf(stderr, "[InkCUDA] prefill chunk %d (auto: %.0f MiB free after the experts, %.0f MiB of K/V still to grow, %d slot(s); --chunk N sets it)\n",
@@ -411,13 +412,29 @@ public:
         return restore_checkpoint(slot, seq_len, false);
     }
     bool supports_shared_checkpoint() const override {
-        return initialized_ && (model_.ls_active || d_sconv_snap_ != nullptr) && max_slots_ <= 8;   // (a layer split: the per-stage copies of save_checkpoint)
+        return initialized_ && (model_.ls_active || d_sconv_snap_ != nullptr);
     }
     bool save_shared_checkpoint(int slot, int seq_len) override {
-        return save_checkpoint(slot, seq_len, true);
+        if (!save_checkpoint(slot, seq_len, true)) return false;
+        if (runner_ && runner_->paged_kv_active && slot >= 0 && slot < (int)shared_ckpts_.size()) {
+            global_shared_ckpt_ = shared_ckpts_[slot];
+            runner_->paged_retain_blocks(slot, seq_len, global_shared_blocks_);
+        }
+        return true;
     }
     bool restore_shared_checkpoint(int slot, int seq_len) override {
         return restore_checkpoint(slot, seq_len, true);
+    }
+    void set_active_slots_mask(uint64_t mask) override {
+        if (runner_) runner_->active_slots_mask = mask;
+    }
+    bool clone_global_shared_prefix(int dst_slot, int seq_len) override {
+        if (!initialized_ || !runner_ || !runner_->paged_kv_active) return false;
+        if (!global_shared_ckpt_.valid || global_shared_ckpt_.seq_len != seq_len || global_shared_blocks_.empty()) return false;
+        if (dst_slot < 0 || dst_slot >= max_slots_) return false;
+        if (!runner_->paged_clone_blocks(dst_slot, global_shared_blocks_)) return false;
+        if (dst_slot < (int)shared_ckpts_.size()) shared_ckpts_[dst_slot] = global_shared_ckpt_;
+        return restore_checkpoint(dst_slot, seq_len, true);
     }
 
     // Layer split (--layer-split, 2+ GPUs): visit v's ShortConv state and SWA ring live on the GPU of the stage that owns its layer, so the
@@ -455,7 +472,7 @@ public:
 
     bool save_checkpoint(int slot, int seq_len, bool shared) {
         if (!initialized_ || slot < 0 || slot >= max_slots_ || (!model_.ls_active && !d_sconv_snap_)) return false;
-        if (seq_len <= 0 || max_slots_ > 8) return false;
+        if (seq_len <= 0) return false;
         auto& ck = (shared ? shared_ckpts_ : prompt_ckpts_)[slot];
         ck.valid = false;
         ck.seq_len = seq_len;
@@ -757,7 +774,25 @@ public:
             }
             if (batch.pos[i] > max_pos_req) max_pos_req = batch.pos[i];
         }
-        if (!runner_->ensure_global_kv_cap(max_pos_req + 1)) {
+        if (runner_->paged_kv_active) {
+            int s_lo[64], s_hi[64];
+            for (int k = 0; k < 64; ++k) { s_lo[k] = 1 << 30; s_hi[k] = -1; }
+            for (int i = 0; i < N; ++i) {
+                const int sl = batch.slot_ids[i];
+                const int p  = batch.pos[i];
+                if (sl >= 0 && sl < 64) {
+                    if (p < s_lo[sl]) s_lo[sl] = p;
+                    if (p > s_hi[sl]) s_hi[sl] = p;
+                }
+            }
+            for (int sl = 0; sl < max_slots_ && sl < 64; ++sl) {
+                if (s_hi[sl] >= 0 && !runner_->paged_ensure_slot_pos(sl, s_lo[sl], s_hi[sl])) {
+                    err = "Host RAM / VRAM exhausted growing paged KV for slot " + std::to_string(sl) + " to " + std::to_string(s_hi[sl] + 1) + " tokens";
+                    kv_grow_failed_ = true;
+                    return false;
+                }
+            }
+        } else if (!runner_->ensure_global_kv_cap(max_pos_req + 1)) {
             err = "VRAM exhausted growing elastic global KV cache to " + std::to_string(max_pos_req + 1) + " tokens";
             kv_grow_failed_ = true;
             return false;
@@ -1183,6 +1218,8 @@ private:
         model_.free_all();
         prompt_ckpts_.clear();
         shared_ckpts_.clear();
+        global_shared_ckpt_ = PromptCkpt{};
+        global_shared_blocks_.clear();
         initialized_ = false;
     }
 
@@ -1226,6 +1263,8 @@ private:
     std::vector<int> snap_M_;
     std::vector<PromptCkpt> prompt_ckpts_;
     std::vector<PromptCkpt> shared_ckpts_;
+    PromptCkpt global_shared_ckpt_;
+    std::vector<int32_t> global_shared_blocks_;
     bool tree_snap_ready_ = false;
     int tree_snap_p0_ = 0;
     int tree_snap_M_ = 0;

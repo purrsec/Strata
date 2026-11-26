@@ -84,8 +84,22 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   endif()
 endif()
 
+add_library(strata_inkling_host_kv STATIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/ink_host_kv_attn.cpp"
+)
+target_include_directories(strata_inkling_host_kv PRIVATE ${_ink_cuda_inc})
+set_target_properties(strata_inkling_host_kv PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" AND NOT WIN32)
+  target_compile_options(strata_inkling_host_kv PRIVATE -O3 -mavx2 -mfma -mf16c)
+endif()
+
 target_link_libraries(strata_inkling_cuda PUBLIC
   strata_inkling_cuda_sm120
+  strata_inkling_host_kv
   strata_quant
   CUDA::cudart
   CUDA::cublas

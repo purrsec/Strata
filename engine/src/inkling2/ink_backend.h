@@ -111,6 +111,12 @@ public:
         (void)slot; (void)seq_len;
         return false;
     }
+    // Cross-slot zero-copy shared prefix clone (refcounted paged global KV + SWA/ShortConv restore)
+    virtual bool clone_global_shared_prefix(int dst_slot, int seq_len) {
+        (void)dst_slot; (void)seq_len;
+        return false;
+    }
+    virtual void set_active_slots_mask(uint64_t mask) { (void)mask; }
 
     // Returns true when the on-device DSpark drafter is initialized and ready to serve drafts (#6633).
     virtual bool dspark_ready() const { return false; }
