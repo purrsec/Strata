@@ -103,6 +103,7 @@ __global__ void __launch_bounds__(256) k_ink_embed_norm(
         }
     }
 
+    if (!emb_norm_w) return;
     ss = block_sum(ss, sh);
     const float inv = rsqrtf(ss / (float)D + kInkRmsEps);
     for (int d = tid; d < D; d += 256) {

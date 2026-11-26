@@ -479,6 +479,8 @@ struct ActiveReq {
     int gov_win_steps = 0;     // speculative steps in the current window
     int gov_win_emit = 0;      // tokens those steps produced
     double gov_gain = -1.0;    // smoothed gain of the last windows (< 0: none yet)
+    double gov_t_plain = 0.0;  // per-request calibrated plain decode ms (varies hugely between 1K vs 108K vs 200K!)
+    double gov_t_spec = 0.0;   // per-request smoothed spec step ms
 };
 
 struct ServeConfig {
@@ -504,7 +506,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     // STRATA_INK_NO_CAND=1: always copy the full logit rows to the host (the old way) instead of the backend's candidate rows.
     bool cand_ok = !(std::getenv("STRATA_INK_NO_CAND") && std::getenv("STRATA_INK_NO_CAND")[0] == '1');
     if (const char* e = std::getenv("STRATA_INK_PREFILL_CAP"); e && *e) prefill_cap = std::max(0, std::atoi(e));
-    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
+    const bool use_dspark = (cfg.draft_mode != "off") && backend.dspark_ready();
     // STRATA_INK_SPEC=block: measurement switch, greedy requests use the linear block-8 drafter + batch verify instead of the beam tree
     const char* spec_env = std::getenv("STRATA_INK_SPEC");
     const bool spec_tree = !(spec_env && std::string(spec_env) == "block");
@@ -512,17 +514,16 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     // steps: the smoothed tokens per step / (spec step ms / plain step ms) below 0.93 turns drafting off for 40 plain steps, then it probes again. The plain step
     // time is measured on the first 4 decode steps of the first request and refreshed by every plain step after that.
     const bool spec_adapt = (spec_env && std::string(spec_env) == "adapt") || cfg.bopts.spec_adapt;
-    double gov_t_plain = 0.0, gov_t_spec = 0.0;
     // one speculative step (the greedy tree step or the sampled block step) took `ms` and produced `n_emit` tokens
     auto gov_step = [&](ActiveReq& rq, int n_emit, double ms) {
-        gov_t_spec = (gov_t_spec <= 0.0) ? ms : 0.8 * gov_t_spec + 0.2 * ms;
+        rq.gov_t_spec = (rq.gov_t_spec <= 0.0) ? ms : 0.75 * rq.gov_t_spec + 0.25 * ms;
         rq.gov_win_steps += 1;
         rq.gov_win_emit += n_emit;
-        if (rq.gov_win_steps >= 12) {
+        if (rq.gov_win_steps >= 8) {
             const double per_step = static_cast<double>(rq.gov_win_emit) / rq.gov_win_steps;
-            const double gain = (gov_t_plain > 0.0 && gov_t_spec > 0.0) ? per_step / (gov_t_spec / gov_t_plain) : 2.0;
+            const double gain = (rq.gov_t_plain > 0.0 && rq.gov_t_spec > 0.0) ? per_step / (rq.gov_t_spec / rq.gov_t_plain) : 2.0;
             rq.gov_gain = (rq.gov_gain < 0.0) ? gain : 0.5 * rq.gov_gain + 0.5 * gain;
-            if (rq.gov_gain < 0.93) { rq.gov_plain_left = 40; rq.gov_gain = -1.0; }
+            if (rq.gov_gain < 0.98) { rq.gov_plain_left = (rq.cur_pos >= 32768) ? 16 : 64; rq.gov_gain = -1.0; }
             rq.gov_win_steps = 0;
             rq.gov_win_emit = 0;
         }
@@ -751,7 +752,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.hist = rq.prompt_ids;
         rq.next_tok = -1;
         rq.gov_plain_left = 0; rq.gov_win_steps = 0; rq.gov_win_emit = 0; rq.gov_gain = -1.0;
-        rq.gov_calib_left = (spec_adapt && gov_t_plain <= 0.0) ? 4 : 0;
+        rq.gov_t_plain = 0.0; rq.gov_t_spec = 0.0;
+        rq.gov_calib_left = spec_adapt ? 4 : 0;
         return true;
     };
 
@@ -1022,7 +1024,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         // 3. Continuous Batched 48-Visit Step across ALL active slots (B = 1..64)!
         // Coalesces chunked-prefill tokens + decode tokens from every active request into ONE StepBatch!
         batch.clear();
-        batch.capture_taps = use_dspark;
+        const bool swa_only_draft = backend.dspark_swa_only();
+        batch.capture_taps = use_dspark && !swa_only_draft;
         merged_img_embeds.clear();
         logit_slots.clear();
         int token_budget = std::max(chunk_sz, n_active);
@@ -1069,6 +1072,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 continue;
             }
             batch.push(s, rq.cur_pos, rq.next_tok, true);
+            if (use_dspark && swa_only_draft && s == 0) batch.capture_taps = true;
             logit_slots.push_back(s);
             --token_budget;
         }
@@ -1115,6 +1119,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     int img_idx = (rq.prompt_img_idx[p_i] >= 0) ? (img_base + rq.prompt_img_idx[p_i]) : -1;
                     batch.push(chosen, p_i, rq.prompt_ids[p_i], is_last, img_idx);
                     if (is_last) logit_slots.push_back(chosen);
+                }
+                if (use_dspark && swa_only_draft && chosen == 0 && (rq.prefill_pos + take > rq.prompt_len - 2064)) {
+                    batch.capture_taps = true;
                 }
                 prefill_fed[chosen] = take;
             }
@@ -1283,10 +1290,10 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             auto& rg = reqs[sole_slot];
             if (rg.gov_calib_left > 0) {
                 --rg.gov_calib_left;
-                if (rg.gov_calib_left < 3) gov_t_plain = (gov_t_plain <= 0.0) ? ms : std::min(gov_t_plain, ms);  // the first step may capture the graph
+                if (rg.gov_calib_left < 3) rg.gov_t_plain = (rg.gov_t_plain <= 0.0) ? ms : std::min(rg.gov_t_plain, ms);  // the first step may capture the graph
             } else {
                 if (rg.gov_plain_left > 0) --rg.gov_plain_left;
-                gov_t_plain = (gov_t_plain <= 0.0) ? ms : 0.9 * gov_t_plain + 0.1 * ms;
+                rg.gov_t_plain = (rg.gov_t_plain <= 0.0) ? ms : 0.9 * rg.gov_t_plain + 0.1 * ms;
             }
         }
     }

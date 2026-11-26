@@ -399,8 +399,10 @@ __global__ void __launch_bounds__(128) k_ink_post_qkv_fused(
         }
 
         if (mode == 2) {
-            // Round to FP16 when KV cache is FP16 so tree_k/tree_v are 100% bitwise identical to committed KV reads!
-            const float kv_val = (kv.kv_fmt != 0) ? val : __half2float(__float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f)));
+            // Round to match committed KV precision (FP16 for kv_fmt=0, BF16 for kv_fmt=4) for exact parity!
+            float kv_val = val;
+            if (kv.kv_fmt == 0) kv_val = __half2float(__float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f)));
+            else if (kv.kv_fmt == 4) kv_val = __bfloat162float(__float2bfloat16_rn(val));
             (is_k ? k_out : v_out)[(size_t)m * kInkKVDim + c] = kv_val;
             (is_k ? stage_k : stage_v)[(size_t)m * kInkKVDim + c] = val;
         } else {
@@ -691,7 +693,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
                 const int blk = kp >> kInkKvBlockShift;
                 const int phys = kv.page_table[(size_t)sl * kv.page_stride + blk];
                 if (phys < 0 || phys >= kv.dev_blocks) {
-                    kp = ((blk + 1) << kInkKvBlockShift) + warp - 4;
+                    int next_kp = (blk + 1) << kInkKvBlockShift;
+                    if (tree_k && next_kp > tp0) next_kp = tp0;
+                    const int rem = (next_kp - (s_beg + warp)) & 3;
+                    kp = next_kp + ((4 - rem) & 3) - 4;
                     continue;
                 }
             }
@@ -727,6 +732,150 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
                 sm_a[0][lane * 4 + 3] * w0 + sm_a[1][lane * 4 + 3] * w1 + sm_a[2][lane * 4 + 3] * w2 + sm_a[3][lane * 4 + 3] * w3);
         }
         __syncthreads();
+    }
+}
+
+// Zero-Spill 1-Warp-Per-Query Fused Multi-Query Global Verify Split-K (M in 2..8):
+// Grid: (8 KV heads, n_splits), Block: M * 32 threads (M warps; warp m owns query m across all 3 Q heads!).
+// Reads EVERY VRAM K entry ONCE for all 3 * M queries, tiles online softmax over M keys (1 rescale per M keys),
+// caches rt[1024] in registers, and uses exact FP32-lossless (exp(-18) < FP32 eps) lazy V-load & V-skip!
+__global__ void __launch_bounds__(256) k_ink_flash_gqa_verify_m8(
+    const float* __restrict__ q,          // [M, 24, 128]
+    const float* __restrict__ rel_table,  // [M, 24, 1025]
+    const float* __restrict__ sinks,      // [M, 24]
+    InkKvVisitDesc kv,
+    int slot0,
+    const int32_t* __restrict__ q_pos,    // [M]
+    const float* __restrict__ tree_k,     // [M, 8, 128]
+    const float* __restrict__ tree_v,     // [M, 8, 128]
+    const uint8_t* __restrict__ tree_anc, // [M, 16]
+    const uint8_t* __restrict__ tree_dep, // [M]
+    int tree_p0,
+    float* __restrict__ part_m,           // [M, 24, sp_stride]
+    float* __restrict__ part_l,           // [M, 24, sp_stride]
+    float* __restrict__ part_o,           // [M, 24, sp_stride, 128]
+    int M,
+    int n_splits,
+    int n_splits_stride = 0,
+    int skip_host = 0) {
+    const int kh   = blockIdx.x;  // 0..7
+    const int sp   = blockIdx.y;  // 0..n_splits-1
+    const int m    = threadIdx.x >> 5;  // 0..M-1 -> 1 warp per query!
+    const int lane = threadIdx.x & 31;  // 0..31 -> 4 dims
+    if (kh >= kInkKVHeads || sp >= n_splits || m >= M) return;
+
+    const int sp_stride = (n_splits_stride > 0) ? n_splits_stride : n_splits;
+    const int h0 = 3 * kh;
+    const float scale = 0.08838834764831845f;
+
+    const int qp = q_pos[m];
+    const float4 qv0 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+    const float* rt0 = rel_table + ((size_t)m * kInkHeads + h0 + 0) * (kInkRelExtent + 1);
+    const float* rt1 = rel_table + ((size_t)m * kInkHeads + h0 + 1) * (kInkRelExtent + 1);
+    const float* rt2 = rel_table + ((size_t)m * kInkHeads + h0 + 2) * (kInkRelExtent + 1);
+    // 99% of keys at 100K+ context have dist >= 1024: cache rt[1024] in registers to eliminate global loads!
+    const float rt0_far = rt0[kInkRelExtent];
+    const float rt1_far = rt1[kInkRelExtent];
+    const float rt2_far = rt2[kInkRelExtent];
+
+    float mw[3] = {
+        (sp == 0) ? sinks[(size_t)m * kInkHeads + h0 + 0] : -1e30f,
+        (sp == 0) ? sinks[(size_t)m * kInkHeads + h0 + 1] : -1e30f,
+        (sp == 0) ? sinks[(size_t)m * kInkHeads + h0 + 2] : -1e30f
+    };
+    float lw[3] = { (sp == 0) ? 1.0f : 0.0f, (sp == 0) ? 1.0f : 0.0f, (sp == 0) ? 1.0f : 0.0f };
+    float a[3][4] = {};
+
+    auto attend3 = [&](float4 kv4, float4 vv4, int k_pos) {
+        const int dist = qp - k_pos;
+        const float b0 = (dist >= kInkRelExtent) ? rt0_far : rt0[max(dist, 0)];
+        const float b1 = (dist >= kInkRelExtent) ? rt1_far : rt1[max(dist, 0)];
+        const float b2 = (dist >= kInkRelExtent) ? rt2_far : rt2[max(dist, 0)];
+        const float d0 = warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale + b0;
+        const float d1 = warp_sum(qv1.x * kv4.x + qv1.y * kv4.y + qv1.z * kv4.z + qv1.w * kv4.w) * scale + b1;
+        const float d2 = warp_sum(qv2.x * kv4.x + qv2.y * kv4.y + qv2.z * kv4.z + qv2.w * kv4.w) * scale + b2;
+        const float sc[3] = {d0, d1, d2};
+#pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const float mn = fmaxf(mw[r], sc[r]);
+            const float al = __expf(mw[r] - mn);
+            const float p  = __expf(sc[r] - mn);
+            lw[r] = lw[r] * al + p;
+            a[r][0] = a[r][0] * al + p * vv4.x;
+            a[r][1] = a[r][1] * al + p * vv4.y;
+            a[r][2] = a[r][2] * al + p * vv4.z;
+            a[r][3] = a[r][3] * al + p * vv4.w;
+            mw[r] = mn;
+        }
+    };
+
+    __shared__ float4 sk[8][32]; // 4 KB
+    __shared__ float4 sv[8][32]; // 4 KB
+    __shared__ int    skp[8];
+
+    const int tp0 = tree_k ? q_pos[0] : tree_p0;
+    const int k_len = max(0, tp0);
+    const int per_sp = (k_len + n_splits - 1) / n_splits;
+    const int s_beg = sp * per_sp;
+    const int s_end = min(k_len, s_beg + per_sp);
+
+    // 1. Committed global KV [s_beg .. s_end): M warps cooperatively load M consecutive keys ONCE for all 3*M queries!
+    int kp_base = s_beg;
+    while (kp_base < s_end) {
+        if (skip_host && kv.page_table != nullptr) {
+            const int blk = kp_base >> kInkKvBlockShift;
+            const int phys = kv.page_table[(size_t)slot0 * kv.page_stride + blk];
+            if (phys < 0 || phys >= kv.dev_blocks) {
+                kp_base = (blk + 1) << kInkKvBlockShift;
+                continue;
+            }
+        }
+        const int kp = kp_base + m;
+        int valid = 0;
+        if (kp < s_end && kp < kv.cap_pos) {
+            bool is_h = false;
+            if (skip_host && kv.page_table != nullptr) {
+                const int blk = kp >> kInkKvBlockShift;
+                const int phys = kv.page_table[(size_t)slot0 * kv.page_stride + blk];
+                if (phys < 0 || phys >= kv.dev_blocks) is_h = true;
+            }
+            if (!is_h) {
+                float4 kv4, vv4;
+                ink_kv_load4(kv, slot0, kp, kh, lane, kv4, vv4);
+                sk[m][lane] = kv4;
+                sv[m][lane] = vv4;
+                valid = 1;
+            }
+        }
+        if (lane == 0) skp[m] = valid ? kp : -1;
+        __syncthreads();
+
+        for (int j = 0; j < M; ++j) {
+            const int k_pos = skp[j];
+            if (k_pos >= 0) attend3(sk[j][lane], sv[j][lane], k_pos);
+        }
+        __syncthreads();
+        kp_base += M;
+    }
+
+    // 2. Staged tree/block tokens (kp >= tp0): folded into split 0!
+    if (sp == 0 && tree_k) {
+        const int dep = (int)tree_dep[m];
+        for (int d = 0; d <= dep; ++d) {
+            const int anc_node = (int)tree_anc[m * kInkMaxTreeDepth + d];
+            const size_t tbase = ((size_t)anc_node * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            attend3(*(const float4*)(tree_k + tbase), *(const float4*)(tree_v + tbase), tp0 + d);
+        }
+    }
+
+    // 3. Write exact split partials directly (no intra-CTA merge needed!)
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * sp_stride + sp;
+        if (lane == 0) { part_m[idx_sp] = mw[r]; part_l[idx_sp] = lw[r]; }
+        *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(a[r][0], a[r][1], a[r][2], a[r][3]);
     }
 }
 
@@ -887,6 +1036,109 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_tide_accum(
     }
     if (d == 0) { part_m[dst_idx] = mg; part_l[dst_idx] = lt; }
     part_o[dst_idx * kInkHeadDim + d] = ov;
+}
+
+// Zero-Spill 1-Warp-Per-Query Fused Multi-Query TideCache BF16C Kernel (M in 2..8):
+// Grid: (8 KV heads, n_sp_tile), Block: M * 32 threads (warp m owns query m across all 3 Q heads!)
+__global__ void __launch_bounds__(256) k_ink_flash_gqa_tide_tile_m8_bf16c(
+    const float* __restrict__ q,
+    const float* __restrict__ rel_table,
+    const int32_t* __restrict__ q_pos,
+    const uint8_t* __restrict__ st_k,
+    const uint8_t* __restrict__ st_v,
+    const float* __restrict__ st_ksc,
+    const float* __restrict__ st_vsc,
+    const InkStreamBlkMeta* __restrict__ meta,
+    int n_blks,
+    float* __restrict__ tile_pm,
+    float* __restrict__ tile_pl,
+    float* __restrict__ tile_po,
+    int M,
+    int n_sp_tile) {
+    const int kh   = blockIdx.x;
+    const int sp   = blockIdx.y;
+    const int m    = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (kh >= kInkKVHeads || sp >= n_sp_tile || m >= M) return;
+
+    const int h0 = 3 * kh;
+    const float scale = 0.08838834764831845f;
+
+    const int qp = q_pos[m];
+    const float4 qv0 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+    const float* rt0 = rel_table + ((size_t)m * kInkHeads + h0 + 0) * (kInkRelExtent + 1);
+    const float* rt1 = rel_table + ((size_t)m * kInkHeads + h0 + 1) * (kInkRelExtent + 1);
+    const float* rt2 = rel_table + ((size_t)m * kInkHeads + h0 + 2) * (kInkRelExtent + 1);
+
+    float mw[3] = {-1e30f, -1e30f, -1e30f};
+    float lw[3] = {0.0f, 0.0f, 0.0f};
+    float a[3][4] = {};
+
+    __shared__ float4 sk[8][32];
+    __shared__ float4 sv[8][32];
+    __shared__ int    skp[8];
+
+    for (int bi = sp; bi < n_blks; bi += n_sp_tile) {
+        const InkStreamBlkMeta bm = meta[bi];
+        const int pos0 = bm.pos_start;
+        const int plen = bm.max_pos_len;
+        const uint32_t smask = bm.slot_mask;
+        const bool m_attends = ((smask >> m) & 1u) != 0u;
+        const size_t blk_base_tok = (size_t)bi * kInkKvBlock;
+
+        for (int t0 = 0; t0 < plen; t0 += M) {
+            const int ti = t0 + m;
+            int kp = -1;
+            if (ti < plen) {
+                kp = pos0 + ti;
+                const size_t head_idx = (blk_base_tok + ti) * kInkKVHeads + kh;
+                const uint8_t* kp_b = st_k + head_idx * 192;
+                const uint8_t* vp_b = st_v + head_idx * 192;
+                const uint32_t emax_k = __float_as_uint(st_ksc[head_idx]);
+                const uint32_t emax_v = __float_as_uint(st_vsc[head_idx]);
+                sk[m][lane] = bf16c_decode4(kp_b, emax_k, lane);
+                sv[m][lane] = bf16c_decode4(vp_b, emax_v, lane);
+            }
+            if (lane == 0) skp[m] = kp;
+            __syncthreads();
+
+            if (m_attends) {
+                for (int j = 0; j < M; ++j) {
+                    const int k_pos = skp[j];
+                    if (k_pos < 0 || k_pos > qp) continue;
+                    const float4 kv4 = sk[j][lane];
+                    const float4 vv4 = sv[j][lane];
+                    const int dist = min(max(qp - k_pos, 0), kInkRelExtent);
+                    const float d0 = warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale + rt0[dist];
+                    const float d1 = warp_sum(qv1.x * kv4.x + qv1.y * kv4.y + qv1.z * kv4.z + qv1.w * kv4.w) * scale + rt1[dist];
+                    const float d2 = warp_sum(qv2.x * kv4.x + qv2.y * kv4.y + qv2.z * kv4.z + qv2.w * kv4.w) * scale + rt2[dist];
+                    const float sc[3] = {d0, d1, d2};
+#pragma unroll
+                    for (int r = 0; r < 3; ++r) {
+                        const float mn = fmaxf(mw[r], sc[r]);
+                        const float al = __expf(mw[r] - mn);
+                        const float p  = __expf(sc[r] - mn);
+                        lw[r] = lw[r] * al + p;
+                        a[r][0] = a[r][0] * al + p * vv4.x;
+                        a[r][1] = a[r][1] * al + p * vv4.y;
+                        a[r][2] = a[r][2] * al + p * vv4.z;
+                        a[r][3] = a[r][3] * al + p * vv4.w;
+                        mw[r] = mn;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_sp_tile + sp;
+        if (lane == 0) { tile_pm[idx_sp] = mw[r]; tile_pl[idx_sp] = lw[r]; }
+        *(float4*)(tile_po + idx_sp * kInkHeadDim + lane * 4) = make_float4(a[r][0], a[r][1], a[r][2], a[r][3]);
+    }
 }
 
 // TideCache GPU Split-K kernel over DMA-staged contiguous BF16C blocks in VRAM (192B/head + 4B e_max)!

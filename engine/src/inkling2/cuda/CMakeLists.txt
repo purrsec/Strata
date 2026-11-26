@@ -86,6 +86,7 @@ endif()
 
 add_library(strata_inkling_host_kv STATIC
   "${CMAKE_CURRENT_SOURCE_DIR}/ink_host_kv_attn.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/ink_dflash2_cpu.cpp"
 )
 target_include_directories(strata_inkling_host_kv PRIVATE ${_ink_cuda_inc})
 set_target_properties(strata_inkling_host_kv PROPERTIES

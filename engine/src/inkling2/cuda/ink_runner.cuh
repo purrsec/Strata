@@ -2079,7 +2079,7 @@ struct InkCudaRunner {
         INK_CK(cudaEventRecord(ev_tide_dma_done[buf], st_dma));
     }
 
-    bool prepare_cpu_host_kv_plan(const int32_t* slot_arr, int slot0, const int32_t* pos_arr, int M) {
+    bool prepare_cpu_host_kv_plan(const int32_t* slot_arr, int slot0, const int32_t* pos_arr, int M, int tree_p0_limit = -1) {
         step_cpu_host_kv = false;
         step_cpu_need_rt = false;
         step_tide_active = false;
@@ -2087,6 +2087,7 @@ struct InkCudaRunner {
         if (!cpu_hk_on || !paged_kv_active || (kv_dtype != InkKvDtype::FP16 && kv_dtype != InkKvDtype::BF16C) || kv_host_slabs <= 0 || M <= 0 || M > kCpuHostMaxM || m.ls_active) {
             return false;
         }
+        if (tree_p0_limit == 0) return false;
         const int max_host_blks = kv_host_slabs * kInkSlabBlocks;
         if ((int)cpu_dedup_idx.size() < max_host_blks) cpu_dedup_idx.assign((size_t)max_host_blks, -1);
         all_ublocks.clear();
@@ -2104,9 +2105,10 @@ struct InkCudaRunner {
         for (int mi = 0; mi < M; ++mi) {
             const int sl = slot_arr ? slot_arr[mi] : slot0;
             const int qp = pos_arr[mi];
+            const int kp_lim = (tree_p0_limit > 0) ? (tree_p0_limit - 1) : qp;
             cpu_slot_qp[mi] = qp;
             const uint32_t bit = 1u << mi;
-            const int last_b = qp >> kInkKvBlockShift;
+            const int last_b = kp_lim >> kInkKvBlockShift;
             const int nb = last_b + 1;
             const int32_t* pt = h_page_table.data() + (size_t)sl * kv_page_stride;
             for (int b = 0; b < nb && b < kv_page_stride; ++b) {
@@ -2114,9 +2116,9 @@ struct InkCudaRunner {
                 if (phys >= kv_dev_blocks) {
                     const int hi = phys - kv_dev_blocks;
                     const int pos_s = b << kInkKvBlockShift;
-                    const int plen  = std::min(kInkKvBlock, qp - pos_s + 1);
+                    const int plen  = std::min(kInkKvBlock, kp_lim - pos_s + 1);
                     if (plen <= 0) continue;
-                    const bool tail = (b == last_b);
+                    const bool tail = (tree_p0_limit < 0) && (b == last_b);
                     if ((qp - (pos_s + plen - 1)) < kInkRelExtent) step_cpu_need_rt = true;
                     const int existing = (hi >= 0 && hi < max_host_blks) ? cpu_dedup_idx[hi] : -1;
                     if (existing >= 0 && all_ublocks[existing].pos_start == pos_s) {
@@ -2414,6 +2416,27 @@ struct InkCudaRunner {
         const size_t off = (size_t)slot * kv_page_stride + b_lo;
         INK_CK(cudaMemcpyAsync(d_page_table + off, h_page_table.data() + off,
                                (size_t)(b_hi - b_lo + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, st));
+    }
+
+    void paged_invalidate_summaries_pos(int slot, int p0, int n_tok) {
+        if (!paged_kv_active || kv_host_slabs <= 0 || slot < 0 || slot >= max_slots || n_tok <= 0) return;
+        const int b0 = std::max(0, p0 >> kInkKvBlockShift);
+        const int b1 = std::min(kv_page_stride - 1, (p0 + n_tok - 1) >> kInkKvBlockShift);
+        const int32_t* pt = h_page_table.data() + (size_t)slot * kv_page_stride;
+        for (int b = b0; b <= b1; ++b) {
+            const int32_t phys = pt[b];
+            if (phys >= kv_dev_blocks) {
+                const int hi = phys - kv_dev_blocks;
+                const int hsl = hi >> kInkSlabShift;
+                const int hbo = hi & kInkSlabMask;
+                for (int gi = 0; gi < 8; ++gi) {
+                    const int gv = kGlobVisits[gi];
+                    if (hsl < (int)host_slabs[gv].size() && hbo < (int)host_slabs[gv][hsl].sums.size()) {
+                        host_slabs[gv][hsl].sums[hbo].valid = 0;
+                    }
+                }
+            }
+        }
     }
 
     bool paged_ensure_slot_pos(int slot, int pos_lo, int pos_hi) {
@@ -3905,7 +3928,8 @@ struct InkCudaRunner {
         const std::string p = "model.llm.layers." + std::to_string(ip);
         const bool is_swa = m.man.c.is_swa[ip] != 0;
         const bool has_msg = (bank_stp != nullptr);
-        const bool exact_x = (mode == 2);
+        static const bool verify_fast_x = [] { const char* e = std::getenv("STRATA_INK_VERIFY_FAST_X"); return e && e[0] == '1'; }();
+        const bool exact_x = (mode == 2) && !verify_fast_x;
         const size_t n_hid = (size_t)M * kInkHidden;
 
         // 1. Attention-Residual Depth Mix (+ Fused Looped Pre-Attn Msg + CatRMS -> eliminates 48+72 launches!)
@@ -4081,12 +4105,12 @@ struct InkCudaRunner {
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
             const bool swa_deferred = (is_swa && mode == 0 && M >= 32);
             if (M <= 16 || mode == 2) {
-                if (!is_swa && mode != 2 && step_cpu_host_kv && step_spec_kv) {
+                if (!is_swa && step_cpu_host_kv && step_spec_kv) {
                     // Stage F: FreeKV (ICLR 2026) + HERALD (Nov 2026) Speculative Sparse 1M with Cosine Correction!
                     int g_idx = -1;
                     for (int gi = 0; gi < 8; ++gi) if (kGlobVisits[gi] == visit) { g_idx = gi; break; }
                     const bool use_cpu = !cpu_ublocks.empty();
-                    const int n_sp_tot  = (M == 1) ? kInkAttnMaxSplits : kInkAttnSplits;
+                    const int n_sp_tot  = (M == 1 || mode == 2) ? kInkAttnMaxSplits : kInkAttnSplits;
                     const int n_sp_vram = n_sp_tot - (use_cpu ? 2 : 1);
                     const int tide_sp   = n_sp_vram;
                     const int cpu_sp    = n_sp_vram + 1;
@@ -4098,13 +4122,21 @@ struct InkCudaRunner {
                     }
                     INK_CK(cudaStreamSynchronize(st));
 
-                    // Launch GPU VRAM-only splits immediately
-                    dim3 gsp(kInkKVHeads, n_sp_vram, M);
-                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                        d_q, d_rel_table, d_sinks,
-                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                        nullptr, nullptr, nullptr, nullptr,
-                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    // Launch GPU VRAM-only splits immediately (+ staged tree tokens when mode == 2!)
+                    if (mode == 2 && M >= 2 && M <= 8) {
+                        k_ink_flash_gqa_verify_m8<<<dim3(kInkKVHeads, n_sp_vram), M * 32, 0, st>>>(
+                            d_q, d_rel_table, d_sinks, kv_desc[visit], slot0, d_pos,
+                            d_k, d_v, d_tree_anc, d_tree_dep,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    } else {
+                        dim3 gsp(kInkKVHeads, n_sp_vram, M);
+                        k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                            d_q, d_rel_table, d_sinks,
+                            kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                            (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                            (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    }
 
                     // FreeKV Section 3.3: verify cosine similarity between Q(t) and Q(t-1)!
                     bool hit = false;
@@ -4135,11 +4167,19 @@ struct InkCudaRunner {
                         INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[buf], 0));
                         const int nsp_t = std::min(kTideTileSplits, std::max(1, cnt));
                         if (kv_dtype == InkKvDtype::BF16C) {
-                            k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
-                                d_q, d_rel_table, d_pos,
-                                reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
-                                d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
-                                cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            if (M >= 2 && M <= 8) {
+                                k_ink_flash_gqa_tide_tile_m8_bf16c<<<dim3(kInkKVHeads, nsp_t), M * 32, 0, st>>>(
+                                    d_q, d_rel_table, d_pos,
+                                    reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                    d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                    cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            } else {
+                                k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                    d_q, d_rel_table, d_pos,
+                                    reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                    d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                    cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            }
                         } else {
                             k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
                                 d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
@@ -4187,12 +4227,12 @@ struct InkCudaRunner {
                         spec_prefetched_cnt = spec_select_and_enqueue(g_idx + 1, prev_q_glob[g_idx + 1].data(), M, nbuf);
                         spec_prefetched_ok = (spec_prefetched_cnt > 0);
                     }
-                } else if (!is_swa && mode != 2 && step_cpu_host_kv) {
+                } else if (!is_swa && step_cpu_host_kv) {
                     // Heterogeneous 3-Tier Split-K (TideCache Async PCIe Gen4 DMA + GPU VRAM + 16-Core AVX2 DDR4):
                     // ALL THREE hardware engines (VRAM 1100 GB/s + PCIe DMA 26.2 GB/s + CPU DDR4 36.9 GB/s) run IN PARALLEL!
                     const bool use_tide = step_tide_active && !gpu_ublocks.empty();
                     const bool use_cpu  = !cpu_ublocks.empty();
-                    const int n_sp_tot  = (M == 1) ? kInkAttnMaxSplits : kInkAttnSplits;
+                    const int n_sp_tot  = (M == 1 || mode == 2) ? kInkAttnMaxSplits : kInkAttnSplits;
                     const int extra_sp  = (use_tide ? 1 : 0) + (use_cpu ? 1 : 0);
                     const int n_sp_vram = n_sp_tot - extra_sp;
                     const int tide_sp   = n_sp_vram;
@@ -4206,13 +4246,21 @@ struct InkCudaRunner {
                         INK_CK(cudaStreamSynchronize(st));
                     }
 
-                    // 1. Launch GPU VRAM-only splits asynchronously on st
-                    dim3 gsp(kInkKVHeads, n_sp_vram, M);
-                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                        d_q, d_rel_table, d_sinks,
-                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                        nullptr, nullptr, nullptr, nullptr,
-                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    // 1. Launch GPU VRAM-only splits asynchronously on st (+ staged tree tokens when mode == 2!)
+                    if (mode == 2 && M >= 2 && M <= 8) {
+                        k_ink_flash_gqa_verify_m8<<<dim3(kInkKVHeads, n_sp_vram), M * 32, 0, st>>>(
+                            d_q, d_rel_table, d_sinks, kv_desc[visit], slot0, d_pos,
+                            d_k, d_v, d_tree_anc, d_tree_dep,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    } else {
+                        dim3 gsp(kInkKVHeads, n_sp_vram, M);
+                        k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                            d_q, d_rel_table, d_sinks,
+                            kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                            (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                            (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_vram, n_sp_tot, 1);
+                    }
 
                     // 2. Launch TideCache ping-pong PCIe DMA tiles on st_dma + GPU VRAM attention on st
                     //    (Tile 0 of this visit was ALREADY prefetched during the 5 preceding SWA visits!)
@@ -4236,11 +4284,19 @@ struct InkCudaRunner {
                             INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[buf], 0));
                             const int nsp_t = std::min(kTideTileSplits, std::max(1, cnt));
                             if (kv_dtype == InkKvDtype::BF16C) {
-                                k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
-                                    d_q, d_rel_table, d_pos,
-                                    reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
-                                    d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
-                                    cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                                if (M >= 2 && M <= 8) {
+                                    k_ink_flash_gqa_tide_tile_m8_bf16c<<<dim3(kInkKVHeads, nsp_t), 96, 0, st>>>(
+                                        d_q, d_rel_table, d_pos,
+                                        reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                        d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                        cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                                } else {
+                                    k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                        d_q, d_rel_table, d_pos,
+                                        reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                        d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                        cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                                }
                             } else {
                                 k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
                                     d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
@@ -4285,13 +4341,20 @@ struct InkCudaRunner {
                     k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp_tot);
                 } else {
                     const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
-                    dim3 gsp(kInkKVHeads, n_sp, M);
-                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                        d_q, d_rel_table, d_sinks,
-                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                        (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
-                        (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
-                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                    if (!is_swa && mode == 2 && M >= 2 && M <= 8) {
+                        k_ink_flash_gqa_verify_m8<<<dim3(kInkKVHeads, n_sp), M * 32, 0, st>>>(
+                            d_q, d_rel_table, d_sinks, kv_desc[visit], slot0, d_pos,
+                            d_k, d_v, d_tree_anc, d_tree_dep,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                    } else {
+                        dim3 gsp(kInkKVHeads, n_sp, M);
+                        k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                            d_q, d_rel_table, d_sinks,
+                            kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                            (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                            (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                            p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                    }
                     k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
                 }
             } else if (mode == 0 && M >= 32 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
@@ -4882,7 +4945,8 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_tree_anc,  h_bytes + 128, kInkMaxTree * kInkMaxTreeDepth, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_tree_dep,  h_bytes + 384, kInkMaxTree, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && !m.ls_active && max_passes_override == 0 && slot0 == 0 && M <= tree_cap && m.n_host_experts == 0) {
+        const bool cpu_hk = (M <= kCpuHostMaxM) ? prepare_cpu_host_kv_plan(nullptr, slot0, h_pos, M, p0) : (step_cpu_host_kv = false, false);
+        if (use_cuda_graph && !cpu_hk && !m.ls_active && max_passes_override == 0 && slot0 == 0 && M <= tree_cap && m.n_host_experts == 0) {
             GraphKey key{M, 2, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }

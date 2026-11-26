@@ -8,6 +8,7 @@
 
 #include "ink_cuda.cuh"
 #include "ink_dspark.cuh"
+#include "ink_dflash2.cuh"
 #include "ink_runner.cuh"
 #include "ink_spec.cuh"
 #include "ink_topk.cuh"
@@ -89,7 +90,8 @@ public:
     bool last_failure_is_kv_growth() const override { return kv_grow_failed_; }
     int kv_capacity_tokens() const override { return (initialized_ && runner_) ? runner_->kv_alloc_ctx : 0; }
 
-    bool dspark_ready() const override { return initialized_ && dspark_ && dspark_->ready; }
+    bool dspark_ready() const override { return initialized_ && ((dspark_ && dspark_->ready) || (dflash2_ && dflash2_->ready)); }
+    bool dspark_swa_only() const override { return initialized_ && dflash2_ && dflash2_->ready; }
 
     std::string device_info() const override { return dev_info_; }
 
@@ -342,7 +344,26 @@ public:
         eff_chunk_run_ = std::max(1, std::min(chunk_try, runner_->max_batch));
         const double led_runner = free_mib();
 
-        if (opts.enable_dspark && model_.man.has_dspark && !model_.ls_active) {
+        if (opts.enable_dspark && !model_.ls_active) {
+            if (const char* df2_pack = std::getenv("STRATA_INK_DFLASH_PACK"); df2_pack && df2_pack[0]) {
+                const auto df2_mode = strata::ink::parse_df2_mode(std::getenv("STRATA_INK_DFLASH_MODE"));
+                dflash2_ = std::make_unique<strata::ink::InkDFlash2>(*runner_);
+                std::string df_err;
+                try {
+                    if (!dflash2_->init(df2_pack, df2_mode, max_slots_, df_err)) {
+                        std::fprintf(stderr, "[InkCUDA] DFlash2 drafter disabled: %s\n", df_err.c_str());
+                        dflash2_->free_all();
+                        dflash2_.reset();
+                    }
+                } catch (const std::exception& ex) {
+                    dflash2_->free_all();
+                    dflash2_.reset();
+                    cudaGetLastError();
+                    std::fprintf(stderr, "[InkCUDA] DFlash2 drafter turned off: %s\n", ex.what());
+                }
+            }
+        }
+        if (opts.enable_dspark && !dflash2_ && model_.man.has_dspark && !model_.ls_active) {
             dspark_ = std::make_unique<strata::ink::InkDSpark>(*runner_);
             try {
                 dspark_->init(eff_max_ctx_, 512);
@@ -354,8 +375,10 @@ public:
             }
         }
         strata::ink::ink_alloc_throws() = false;
-        std::fprintf(stderr, "[InkCUDA] memory: %.0f MiB free after load, runner+KV took %.0f MiB (max_batch=%d), DSpark took %.0f MiB, %.0f MiB free now\n",
-                     led_loaded, led_loaded - led_runner, runner_->max_batch, led_runner - free_mib(), free_mib());
+        std::fprintf(stderr, "[InkCUDA] memory: %.0f MiB free after load, runner+KV took %.0f MiB (max_batch=%d), %s took %.0f MiB, %.0f MiB free now\n",
+                     led_loaded, led_loaded - led_runner, runner_->max_batch,
+                     (dflash2_ && dflash2_->ready) ? "DFlash2" : "DSpark",
+                     led_runner - free_mib(), free_mib());
 
         runner_->pick_cold_lane();   // STRATA_INK_EXACT unset: time the CPU lane and the copy-in lane for the cold experts once, keep the faster
 
@@ -401,7 +424,7 @@ public:
         snap_active_[slot] = false;
         if (slot < (int)prompt_ckpts_.size()) prompt_ckpts_[slot].valid = false;
         if (slot < (int)shared_ckpts_.size()) shared_ckpts_[slot].valid = false;
-        if (slot == 0) { dspark_slot_ = -1; tree_snap_ready_ = false; }
+        if (slot == 0) { dspark_slot_ = -1; dflash2_slot_ = -1; dflash2_valid_pos_ = -1; tree_snap_ready_ = false; }
     }
 
     // #6627: Save/restore slot's ShortConv (3.83 MB) + 40 SWA KV ring windows (<=160 MiB in host RAM) + DSpark SWA KV
@@ -647,6 +670,7 @@ public:
         } else if (slot == 0) {
             dspark_slot_ = -1;
         }
+        if (slot == 0) { dflash2_slot_ = -1; dflash2_valid_pos_ = -1; }
         ckpt_sync();
         if (runner_->paged_kv_active && seq_len > 0) {
             const int keep_blks = (seq_len + strata::ink::kInkKvBlock - 1) >> strata::ink::kInkKvBlockShift;
@@ -678,6 +702,7 @@ public:
                     runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_keep, slot, runner_->max_slots, runner_->tree_cap);
             }
             snap_active_[slot] = false;
+            if (slot == 0 && dflash2_ && dflash2_->ready && dflash2_slot_ == 0) dflash2_valid_pos_ = keep_len;
             return;
         }
         if (slot == 0 && tree_snap_ready_) {
@@ -945,9 +970,10 @@ public:
                     runner_->has_img_step = false;
                 }
 
-                const bool want_taps = (taps_out != nullptr) || (batch.capture_taps && dspark_ && dspark_->ready && slot == 0);
+                const bool df2_on = (dflash2_ && dflash2_->ready && slot == 0);
+                const bool want_taps = (taps_out != nullptr) || (batch.capture_taps && slot == 0 && ((dspark_ && dspark_->ready) || df2_on));
 
-                // If snapshot_slot(slot) is active for DSpark verify (M <= 16, no images):
+                // If snapshot_slot(slot) is active for DSpark/DFlash2 verify (M <= 16, no images):
                 // run forward_tree_verify (stages ShortConv + KV) & commit all M tokens so rollback_slot can replay exact n_keep!
                 if (snap_active_[slot] && !any_img && M <= 16 && total_m <= 16) {
                     strata::ink::InkTreeSpec tr{};
@@ -966,6 +992,7 @@ public:
                         runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, M, slot, runner_->max_slots, runner_->tree_cap);
                     strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
                         runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, p0, M, slot, runner_->tree_cap);
+                    runner_->paged_invalidate_summaries_pos(slot, p0, M);
                     snap_p0_[slot] = p0;
                     snap_M_[slot] = M;
                 } else {
@@ -976,6 +1003,11 @@ public:
                 if (batch.capture_taps && dspark_ && dspark_->ready && slot == 0 && p0 + M <= dspark_->max_ctx) {
                     dspark_->ingest_taps(p0, M);
                     dspark_slot_ = 0;
+                }
+                if (batch.capture_taps && df2_on) {
+                    dflash2_->ingest_taps(p0, M, 0);
+                    dflash2_slot_ = 0;
+                    dflash2_valid_pos_ = p0 + M;
                 }
                 if (taps_out) {
                     std::vector<int> slice(idxs.begin() + off, idxs.begin() + off + M);
@@ -1062,6 +1094,40 @@ public:
         return true;
     }
 
+    int df2_pick_nd(const float conf7[7], int cap) const {
+        static const int max_d_env = [] { const char* e = std::getenv("STRATA_INK_DFLASH_MAX_DRAFT"); return (e && std::atoi(e) > 0) ? std::min(7, std::atoi(e)) : 7; }();
+        static const int fixed_env = [] { const char* e = std::getenv("STRATA_INK_DFLASH_FIXED"); return (e && e[0] == '1') ? 1 : 0; }();
+        static const double conf_env = [] { const char* e = std::getenv("STRATA_INK_DFLASH_CONF"); return e ? std::atof(e) : 0.0; }();
+        static const double cost_env = [] { const char* e = std::getenv("STRATA_INK_DFLASH_COST"); return (e && std::atof(e) > 0.0) ? std::atof(e) : 2.5; }();
+        const int lim = std::max(1, std::min(cap, max_d_env));
+        if (fixed_env) return lim;
+        if (conf_env > 0.0) {
+            // Confidence threshold cut (like Strata's --draft-conf P): stop where cumulative prob < P
+            double cum_p = 1.0;
+            int nd = 1;
+            for (int k = 1; k <= lim; ++k) {
+                cum_p *= std::max(0.0, std::min(1.0, (double)conf7[k - 1]));
+                if (cum_p >= conf_env) nd = k;
+                else break;
+            }
+            return nd;
+        }
+        double best_rate = -1.0;
+        int best_nd = std::min(2, lim);
+        double cum_p = 1.0;
+        double e_tok = 1.0;
+        for (int k = 1; k <= lim; ++k) {
+            cum_p *= std::max(0.0, std::min(1.0, (double)conf7[k - 1]));
+            e_tok += cum_p;
+            if (k >= 2 || k == lim) {
+                const double exp_frac = 1.0 - std::pow(15.0 / 16.0, (double)(k + 1));
+                const double rate = e_tok / (1.0 + cost_env * exp_frac);
+                if (rate > best_rate) { best_rate = rate; best_nd = k; }
+            }
+        }
+        return best_nd;
+    }
+
     int dspark_draft(
         int slot,
         int32_t anchor_tok,
@@ -1069,9 +1135,24 @@ public:
         int max_draft,
         int32_t* out_draft_ids,
         std::string& /*err*/) override {
-        if (!initialized_ || model_.ls_active || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
+        if (!initialized_ || model_.ls_active || slot != 0) return 0;
+        if (dflash2_ && dflash2_->ready && dflash2_slot_ == 0 && dflash2_valid_pos_ == anchor_pos) {
+            if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_) return 0;
+            if (!runner_->ensure_global_kv_cap(anchor_pos + 8)) return 0;
+            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
+            int32_t ids7[7] = {};
+            float conf7[7] = {};
+            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, 0);
+            const int cap = std::max(0, std::min(7, max_draft));
+            if (cap <= 0) return 0;
+            const int best_nd = df2_pick_nd(conf7, cap);
+            for (int i = 0; i < best_nd; ++i) out_draft_ids[i] = ids7[i];
+            return best_nd;
+        }
+        if (!dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
         if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_ || anchor_pos + 8 >= dspark_->max_ctx) return 0;
         if (!runner_->ensure_global_kv_cap(anchor_pos + 8) || !dspark_->ensure_ctx_cap(anchor_pos + 8)) return 0;
+        if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
         int32_t ids7[8] = {};
         float conf7[8] = {};
         dspark_->draft_block8(anchor_tok, anchor_pos, ids7, conf7);
@@ -1104,9 +1185,95 @@ public:
         int32_t* out_emitted,
         int* out_drafted,
         std::string& /*err*/) override {
-        if (!initialized_ || model_.ls_active || !dspark_ || !dspark_->ready || slot != 0 || dspark_slot_ != 0) return 0;
-        if (anchor_pos <= 0 || anchor_pos + 12 >= eff_max_ctx_ || anchor_pos + 12 >= dspark_->max_ctx || max_emit < 1 || !out_emitted) return 0;
+        if (!initialized_ || model_.ls_active || slot != 0 || max_emit < 1 || !out_emitted) return 0;
+
+        // Fast zero-D2H greedy Block-8 verify for InkDFlash2 (supports Paged 1M KV + BF16C + TideCache + Host-KV + FreeKV!)
+        if (dflash2_ && dflash2_->ready && dflash2_slot_ == 0 && dflash2_valid_pos_ == anchor_pos) {
+            if (anchor_pos <= 0 || anchor_pos + 8 >= eff_max_ctx_) return 0;
+            if (!runner_->ensure_global_kv_cap(anchor_pos + 8)) return 0;
+            if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 7)) return 0;
+
+            using Clock = std::chrono::steady_clock;
+            const auto t0 = Clock::now();
+            // 1. Snapshot slot-0 ShortConv pre-verify state (2.5 us) for exact mid-block EOS rollback!
+            strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
+
+            // 2. Draft up to 7 tokens in 1 parallel DFlash2 block pass (HYBRID / GPU / STREAM / CPU)
+            int32_t ids7[7] = {};
+            float conf7[7] = {};
+            dflash2_->draft_block8(anchor_tok, anchor_pos, ids7, conf7, 0);
+            const auto t1 = Clock::now();
+            const int cap = std::max(1, std::min(7, max_emit - 1));
+            const int nd = df2_pick_nd(conf7, cap);
+
+            strata::ink::InkTreeSpec tr = strata::ink::make_chain_tree(anchor_tok, ids7, nd);
+
+            // 3. Single 48-visit verify (with Paged KV + BF16C + TideCache + Host-KV!) + exact GPU argmax
+            runner_->forward_tree_verify(tr, anchor_pos, 0, true);
+            int32_t target_next[strata::ink::kInkMaxTree] = {};
+            runner_->head_argmax_exact(tr.M, target_next);
+            const auto t2 = Clock::now();
+
+            // 4. Exact lossless greedy verification walk
+            const int emit_cap = std::min(max_emit, nd + 1);
+            int32_t path[16] = {};
+            int n_emit = 0;
+            for (int i = 0; i < emit_cap; ++i) {
+                path[n_emit] = i;
+                const int32_t tok_next = target_next[i];
+                out_emitted[n_emit++] = tok_next;
+                if (i == nd || tok_next != ids7[i]) break;
+            }
+
+            // 5. Commit ONLY accepted tokens (ShortConv + Paged/Linear KV + FreeKV summary invalidation) + ingest accepted taps
+            INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_emit * 4, cudaMemcpyHostToDevice, runner_->st));
+            strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+                runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_emit, 0, runner_->max_slots, runner_->tree_cap);
+            strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
+                runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, anchor_pos, n_emit, 0, runner_->tree_cap);
+            runner_->paged_invalidate_summaries_pos(0, anchor_pos, n_emit);
+            for (int t = 0; t < 4; ++t) {
+                strata::ink::k_ink_compact_taps<<<n_emit, 256, 0, runner_->st>>>(
+                    runner_->d_taps[t], runner_->d_taps_compact[t], runner_->d_acc_path, n_emit);
+            }
+            const auto t3 = Clock::now();
+            dflash2_->ingest_taps_from(runner_->d_taps_compact, anchor_pos, n_emit, 0);
+            if (spec_cfg_.log) INK_CK(cudaStreamSynchronize(runner_->st));
+            const auto t4 = Clock::now();
+
+            dflash2_valid_pos_ = anchor_pos + n_emit;
+            tree_snap_ready_ = true;
+            tree_snap_p0_ = anchor_pos;
+            tree_snap_M_ = n_emit;
+            for (int i = 0; i < n_emit; ++i) tree_snap_path_[i] = path[i];
+
+            if (spec_cfg_.log) {
+                static long st_steps = 0, st_emit = 0, st_nodes = 0;
+                static double s_dr = 0, s_vr = 0, s_cm = 0, s_in = 0;
+                ++st_steps; st_emit += n_emit; st_nodes += tr.M;
+                s_dr += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                s_vr += std::chrono::duration<double, std::milli>(t2 - t1).count();
+                s_cm += std::chrono::duration<double, std::milli>(t3 - t2).count();
+                s_in += std::chrono::duration<double, std::milli>(t4 - t3).count();
+                if (st_steps % 20 == 0) {
+                    const double tot_ms = s_dr + s_vr + s_cm + s_in;
+                    std::fprintf(stderr,
+                        "[DF2-STATS mode=%s] steps=%ld mean_M=%.2f mean_acc=%.2f | draft=%.2fms verify=%.2fms commit=%.2fms ingest=%.2fms -> %.1f tok/s\n",
+                        strata::ink::df2_mode_name(dflash2_->mode), st_steps,
+                        (double)st_nodes / st_steps, (double)st_emit / st_steps,
+                        s_dr / st_steps, s_vr / st_steps, s_cm / st_steps, s_in / st_steps,
+                        (double)st_emit / (tot_ms * 1e-3));
+                }
+            }
+            if (out_drafted) *out_drafted = nd;
+            return n_emit;
+        }
+
+        if (!dspark_ || !dspark_->ready || dspark_slot_ != 0) return 0;
+        if (anchor_pos <= 0 || anchor_pos + 12 >= eff_max_ctx_ || anchor_pos + 12 >= dspark_->max_ctx) return 0;
         if (!runner_->ensure_global_kv_cap(anchor_pos + 12) || !dspark_->ensure_ctx_cap(anchor_pos + 12)) return 0;
+        if (runner_->paged_kv_active && !runner_->paged_ensure_slot_pos(0, anchor_pos, anchor_pos + 11)) return 0;
 
         // 1. Snapshot slot-0 ShortConv pre-verify state (2.5 us) for exact mid-tree EOS rollback if needed!
         strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
@@ -1214,6 +1381,7 @@ private:
     }
 
     void cleanup() {
+        if (dflash2_) { dflash2_->free_all(); dflash2_.reset(); }
         if (dspark_) { dspark_->free_all(); dspark_.reset(); }
         if (runner_) { runner_->free_all(); runner_.reset(); }
         if (d_sconv_snap_) { cudaFree(d_sconv_snap_); d_sconv_snap_ = nullptr; }
@@ -1251,12 +1419,15 @@ private:
     bool kv_grow_failed_ = false;    // the last forward_batch ended only because the global K/V could not grow
     int eff_chunk_run_ = 0;          // the prefill chunk the runner really got (after auto / halve-on-fail)
     int dspark_slot_ = -1;
+    int dflash2_slot_ = -1;
+    int dflash2_valid_pos_ = -1;
     KvDtype kv_dtype_ = KvDtype::FP16;
     std::string dev_info_;
 
     strata::ink::InkCudaModel model_;
     std::unique_ptr<strata::ink::InkCudaRunner> runner_;
     std::unique_ptr<strata::ink::InkDSpark> dspark_;
+    std::unique_ptr<strata::ink::InkDFlash2> dflash2_;
     float* d_sconv_snap_ = nullptr;
     void* d_test_steal_ = nullptr;   // STRATA_INK_TEST_STEAL_MIB test hook
     float* d_h_sel_ = nullptr;

@@ -4250,7 +4250,7 @@ inline void launch_ink_moe_dispatch_only(
         // four Q8_0 layers of a UD-Q4_K_XL file cost 14.1 ms per step at 64 slots on a 5090 (floor 2.4 ms), 30.9 ms on an A6000, 17.9 ms on a 4090;
         // 2 per group costs 8.0 / 19.9 / 12.7 ms. Equal at 8 slots. STRATA_INK_GGUF_MT = 1 / 2 / 4 / 8 / 16 forces a value.
         static const int gg_mt = [] { const char* e = std::getenv("STRATA_INK_GGUF_MT"); return e ? std::atoi(e) : 0; }();
-        const int gmt = (M == 1) ? 1 : (gg_mt > 0 ? gg_mt : (M <= 128 ? 2 : 16));
+        const int gmt = (M == 1) ? 1 : (gg_mt > 0 ? gg_mt : ((M >= 4 && M <= 16) ? 8 : (M <= 128 ? 2 : 16)));
         // Q8_0 experts on the int8 tensor cores (k_ink_moe_q80_tc, bit for bit the dp4a kernels' results) from 256 tokens: a 2048-token prefill chunk of a
         // UD-Q4_K_XL file on an RTX 4090 goes from 2,805 to 3,370 ppts; below that (decode batches) the dp4a kernels are faster (8 slots 2.3 against
         // 4.6 ms, 64 slots 12.7 against 17.1 ms). STRATA_INK_Q80_TC = N: from N tokens, 0 = never.
