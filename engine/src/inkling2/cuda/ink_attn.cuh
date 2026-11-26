@@ -24,11 +24,34 @@ namespace strata::ink {
 
 // ---- KV Cache Representation (Native GPU FP16, FP8 E4M3, K8V8 INT8, and K8V4 INT8/INT4!) ----
 enum class InkKvDtype : int {
-    FP16 = 0,
-    FP8  = 1,
-    K8V8 = 2,
-    K8V4 = 3,
+    FP16  = 0,
+    FP8   = 1,
+    K8V8  = 2,
+    K8V4  = 3,
+    BF16C = 4,  // GAAC-12/LoomKV lossless BF16 exponent-packed (192B/head + 4B e_max = 0.766x, bit-exact over 2^14 dynamic range!)
 };
+constexpr int kInkBf16cHeadBytes = 192;  // 128 B [sign|mant7] + 64 B [4-bit exp delta]
+
+__device__ __forceinline__ float4 bf16c_decode4(const uint8_t* head192, uint32_t e_max, int lane) {
+    const uint32_t sm4 = *reinterpret_cast<const uint32_t*>(head192 + (size_t)lane * 4);
+    const uint16_t ex4 = *reinterpret_cast<const uint16_t*>(head192 + 128 + (size_t)lane * 2);
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t sm  = (sm4 >> (8 * k)) & 0xFFu;
+        const uint32_t nib = (ex4 >> (4 * k)) & 0xFu;
+        const uint32_t bf  = (nib == 15u) ? 0u : (((sm & 0x80u) << 8) | ((e_max - nib) << 7) | (sm & 0x7Fu));
+        f[k] = __uint_as_float(bf << 16);
+    }
+    return make_float4(f[0], f[1], f[2], f[3]);
+}
+
+__device__ __forceinline__ uint16_t bf16c_decode1_bits(const uint8_t* head192, uint32_t e_max, int d) {
+    const uint32_t sm  = head192[d];
+    const uint8_t  exb = head192[128 + (d >> 1)];
+    const uint32_t nib = (d & 1) ? (exb >> 4) : (exb & 0xFu);
+    return (nib == 15u) ? 0u : (uint16_t)(((sm & 0x80u) << 8) | ((e_max - nib) << 7) | (sm & 0x7Fu));
+}
 
 // Per-visit KV cache descriptor passed by value to attention kernels (CUDA-Graph friendly!)
 // Supports zero-copy Host KV Offloading: global tokens [0..dev_cap-1] live in VRAM and [dev_cap..cap_pos-1]
@@ -161,7 +184,7 @@ __device__ __forceinline__ void ink_kv_load4(
                           (float)(int8_t)((k4 >> 16) & 0xFFu) * sk, (float)(int8_t)(k4 >> 24) * sk);
         vv4 = make_float4((float)(int8_t)(v4 & 0xFFu) * sv, (float)(int8_t)((v4 >> 8) & 0xFFu) * sv,
                           (float)(int8_t)((v4 >> 16) & 0xFFu) * sv, (float)(int8_t)(v4 >> 24) * sv);
-    } else {
+    } else if (kv.kv_fmt == 3) {
         const uint8_t* pk = reinterpret_cast<const uint8_t*>(a.pk);
         const uint8_t* pv = reinterpret_cast<const uint8_t*>(a.pv);
         const float sk = a.pksc[hbase];
@@ -175,6 +198,13 @@ __device__ __forceinline__ void ink_kv_load4(
         const int v2 = (int)((vp >> 8) & 0xFu) - 8;
         const int v3 = (int)((vp >> 12) & 0xFu) - 8;
         vv4 = make_float4((float)v0 * sv, (float)v1 * sv, (float)v2 * sv, (float)v3 * sv);
+    } else {  // BF16C (kv_fmt == 4): GAAC-12 lossless BF16 exponent-packed (192 B/head + 4 B e_max)
+        const uint8_t* pk = reinterpret_cast<const uint8_t*>(a.pk) + hbase * kInkBf16cHeadBytes;
+        const uint8_t* pv = reinterpret_cast<const uint8_t*>(a.pv) + hbase * kInkBf16cHeadBytes;
+        const uint32_t ek = __float_as_uint(a.pksc[hbase]);
+        const uint32_t ev = __float_as_uint(a.pvsc[hbase]);
+        kv4 = bf16c_decode4(pk, ek, lane);
+        vv4 = bf16c_decode4(pv, ev, lane);
     }
 }
 
@@ -188,6 +218,31 @@ __device__ __forceinline__ void ink_kv_store_128(
     if (kv.kv_fmt == 0) {
         __half* dst = const_cast<__half*>(reinterpret_cast<const __half*>(is_k ? a.pk : a.pv));
         dst[base + tid] = __float2half_rn(fminf(fmaxf(val, -65504.0f), 65504.0f));
+        return;
+    }
+    if (kv.kv_fmt == 4) {
+        // Exact IEEE-754 RNE FP32 -> BF16, then pack [sign|mant7] (128B) + 4-bit exponent delta (64B) + e_max!
+        const uint32_t fb = __float_as_uint(val);
+        const uint32_t rnd = 0x7FFFu + ((fb >> 16) & 1u);
+        const uint16_t bf = ((fb & 0x7FFFFFFFu) > 0x7F800000u)
+                          ? (uint16_t)((fb >> 16) | 0x0040u)
+                          : (uint16_t)((fb + rnd) >> 16);
+        const int exp = (bf >> 7) & 0xFF;
+        float em_f = warp_max((float)exp);
+        if ((tid & 31) == 0) sh[tid >> 5] = em_f;
+        __syncthreads();
+        const int e_max = (int)fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
+        const int delta = e_max - exp;
+        const uint32_t nib = (exp == 0 || delta >= 15) ? 15u : (uint32_t)delta;
+        const uint32_t nib_hi = __shfl_xor_sync(0xFFFFFFFFu, nib, 1);
+        uint8_t* dst192 = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(is_k ? a.pk : a.pv))
+                        + hbase * kInkBf16cHeadBytes;
+        dst192[tid] = (uint8_t)(((bf >> 8) & 0x80u) | (bf & 0x7Fu));
+        if ((tid & 1) == 0) dst192[128 + (tid >> 1)] = (uint8_t)(nib | (nib_hi << 4));
+        if (tid == 0) {
+            float* dst_sc = const_cast<float*>(is_k ? a.pksc : a.pvsc);
+            dst_sc[hbase] = __uint_as_float((uint32_t)e_max);
+        }
         return;
     }
     float mv = warp_max(fabsf(val));
@@ -834,6 +889,109 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_tide_accum(
     part_o[dst_idx * kInkHeadDim + d] = ov;
 }
 
+// TideCache GPU Split-K kernel over DMA-staged contiguous BF16C blocks in VRAM (192B/head + 4B e_max)!
+__global__ void __launch_bounds__(128) k_ink_flash_gqa_tide_tile_bf16c(
+    const float* __restrict__ q,
+    const float* __restrict__ rel_table,
+    const int32_t* __restrict__ q_pos,
+    const uint8_t* __restrict__ st_k,            // [n_blks, 256, 8, 192] contiguous VRAM
+    const uint8_t* __restrict__ st_v,            // [n_blks, 256, 8, 192] contiguous VRAM
+    const float* __restrict__ st_ksc,            // [n_blks, 256, 8]
+    const float* __restrict__ st_vsc,            // [n_blks, 256, 8]
+    const InkStreamBlkMeta* __restrict__ meta,
+    int n_blks,
+    float* __restrict__ tile_pm,
+    float* __restrict__ tile_pl,
+    float* __restrict__ tile_po,
+    int M,
+    int n_sp_tile) {
+    const int kh = blockIdx.x;
+    const int sp = blockIdx.y;
+    const int m  = blockIdx.z;
+    if (kh >= kInkKVHeads || sp >= n_sp_tile || m >= M) return;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int qp   = q_pos[m];
+    const float scale = 0.08838834764831845f;
+    const int h0 = 3 * kh;
+
+    const float4 qv0 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)m * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+    const float* rt0 = rel_table + ((size_t)m * kInkHeads + h0 + 0) * (kInkRelExtent + 1);
+    const float* rt1 = rel_table + ((size_t)m * kInkHeads + h0 + 1) * (kInkRelExtent + 1);
+    const float* rt2 = rel_table + ((size_t)m * kInkHeads + h0 + 2) * (kInkRelExtent + 1);
+
+    float mw[3] = {-1e30f, -1e30f, -1e30f};
+    float lw[3] = {0.0f, 0.0f, 0.0f};
+    float a[3][4] = {};
+
+    const uint32_t mbit = 1u << m;
+    const int b_per = (n_blks + n_sp_tile - 1) / n_sp_tile;
+    const int b_beg = sp * b_per;
+    const int b_end = min(n_blks, b_beg + b_per);
+
+    for (int bi = b_beg; bi < b_end; ++bi) {
+        const InkStreamBlkMeta bm = meta[bi];
+        if ((bm.slot_mask & mbit) == 0u) continue;
+        const int plen = min(bm.max_pos_len, qp - bm.pos_start + 1);
+        if (plen <= 0) continue;
+        const size_t blk_base = (size_t)bi * kInkKvBlock;
+        for (int t = warp; t < plen; t += 4) {
+            const int kp = bm.pos_start + t;
+            const size_t hbase = (blk_base + t) * kInkKVHeads + kh;
+            const float4 kv4 = bf16c_decode4(st_k + hbase * kInkBf16cHeadBytes, __float_as_uint(st_ksc[hbase]), lane);
+            const float4 vv4 = bf16c_decode4(st_v + hbase * kInkBf16cHeadBytes, __float_as_uint(st_vsc[hbase]), lane);
+            const int dist = min(max(qp - kp, 0), kInkRelExtent);
+            float d0 = warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale + rt0[dist];
+            float d1 = warp_sum(qv1.x * kv4.x + qv1.y * kv4.y + qv1.z * kv4.z + qv1.w * kv4.w) * scale + rt1[dist];
+            float d2 = warp_sum(qv2.x * kv4.x + qv2.y * kv4.y + qv2.z * kv4.z + qv2.w * kv4.w) * scale + rt2[dist];
+            const float sc[3] = {d0, d1, d2};
+#pragma unroll
+            for (int r = 0; r < 3; ++r) {
+                const float mn = fmaxf(mw[r], sc[r]);
+                const float al = __expf(mw[r] - mn);
+                const float p  = __expf(sc[r] - mn);
+                lw[r] = lw[r] * al + p;
+                a[r][0] = a[r][0] * al + p * vv4.x;
+                a[r][1] = a[r][1] * al + p * vv4.y;
+                a[r][2] = a[r][2] * al + p * vv4.z;
+                a[r][3] = a[r][3] * al + p * vv4.w;
+                mw[r] = mn;
+            }
+        }
+    }
+
+    __shared__ float sm_m[4], sm_l[4], sm_a[4][kInkHeadDim];
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        if (lane == 0) { sm_m[warp] = mw[r]; sm_l[warp] = lw[r]; }
+        sm_a[warp][lane * 4 + 0] = a[r][0];
+        sm_a[warp][lane * 4 + 1] = a[r][1];
+        sm_a[warp][lane * 4 + 2] = a[r][2];
+        sm_a[warp][lane * 4 + 3] = a[r][3];
+        __syncthreads();
+        if (warp == 0) {
+            float mg = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
+            float w0 = sm_l[0] > 0.0f ? __expf(sm_m[0] - mg) : 0.0f;
+            float w1 = sm_l[1] > 0.0f ? __expf(sm_m[1] - mg) : 0.0f;
+            float w2 = sm_l[2] > 0.0f ? __expf(sm_m[2] - mg) : 0.0f;
+            float w3 = sm_l[3] > 0.0f ? __expf(sm_m[3] - mg) : 0.0f;
+            const float lt = sm_l[0] * w0 + sm_l[1] * w1 + sm_l[2] * w2 + sm_l[3] * w3;
+            const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_sp_tile + sp;
+            if (lane == 0) { tile_pm[idx_sp] = mg; tile_pl[idx_sp] = lt; }
+            *(float4*)(tile_po + idx_sp * kInkHeadDim + lane * 4) = make_float4(
+                sm_a[0][lane * 4 + 0] * w0 + sm_a[1][lane * 4 + 0] * w1 + sm_a[2][lane * 4 + 0] * w2 + sm_a[3][lane * 4 + 0] * w3,
+                sm_a[0][lane * 4 + 1] * w0 + sm_a[1][lane * 4 + 1] * w1 + sm_a[2][lane * 4 + 1] * w2 + sm_a[3][lane * 4 + 1] * w3,
+                sm_a[0][lane * 4 + 2] * w0 + sm_a[1][lane * 4 + 2] * w1 + sm_a[2][lane * 4 + 2] * w2 + sm_a[3][lane * 4 + 2] * w3,
+                sm_a[0][lane * 4 + 3] * w0 + sm_a[1][lane * 4 + 3] * w1 + sm_a[2][lane * 4 + 3] * w2 + sm_a[3][lane * 4 + 3] * w3);
+        }
+        __syncthreads();
+    }
+}
+
 // Inject CPU-computed host-KV partial [M, 24, 130] (128 o + m + l) into split index `dst_sp` of Split-K buffers!
 __global__ void __launch_bounds__(128) k_ink_attn_inject_split(
     const float* __restrict__ host_in,    // [M, 24, 130]
@@ -1062,15 +1220,24 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
                     } else if (kv.kv_fmt == 2) {
                         kf = (float)(int8_t)pk8[base] * pksc[hbase];
                         vf = (float)(int8_t)pv8[base] * pvsc[hbase];
-                    } else {
+                    } else if (kv.kv_fmt == 3) {
                         kf = (float)(int8_t)pk8[base] * pksc[hbase];
                         const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
                         const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
                         vf = (float)qv * pvsc[hbase];
+                    } else {
+                        const uint16_t bfk = bf16c_decode1_bits(pk8 + hbase * kInkBf16cHeadBytes, __float_as_uint(pksc[hbase]), d);
+                        const uint16_t bfv = bf16c_decode1_bits(pv8 + hbase * kInkBf16cHeadBytes, __float_as_uint(pvsc[hbase]), d);
+                        kf = __uint_as_float((uint32_t)bfk << 16);
+                        vf = __uint_as_float((uint32_t)bfv << 16);
                     }
                     kb = pf_cvt_from_f32<true>(kf);
                     vb = pf_cvt_from_f32<true>(vf);
                 }
+            } else if (kv.kv_fmt == 4) {
+                // Direct bit-exact BF16 unpack into BF16 prefill buffer (ZERO float round-trip!)
+                kb = bf16c_decode1_bits(pk8 + hbase * kInkBf16cHeadBytes, __float_as_uint(pksc[hbase]), d);
+                vb = bf16c_decode1_bits(pv8 + hbase * kInkBf16cHeadBytes, __float_as_uint(pvsc[hbase]), d);
             } else {
                 float kf, vf;
                 if (kv.kv_fmt == 0) {
@@ -1124,6 +1291,37 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv_staged(
     } else {
         kb = pf_cvt_from_f32<false>(__half2float(st_k[base]));
         vb = pf_cvt_from_f32<false>(__half2float(st_v[base]));
+    }
+    uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
+    uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);
+    const int h0 = 3 * kh;
+    k_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = kb;
+    k_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = kb;
+    k_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = kb;
+    v_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = vb;
+    v_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = vb;
+    v_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = vb;
+}
+
+template <bool USE_FP16 = false>
+__global__ void __launch_bounds__(128) k_ink_pf_pack_kv_staged_bf16c(
+    const uint8_t* __restrict__ st_k,
+    const uint8_t* __restrict__ st_v,
+    const float* __restrict__ st_ksc,
+    const float* __restrict__ st_vsc,
+    int K_len,
+    void* __restrict__ k_out_v,
+    void* __restrict__ v_out_v) {
+    const int kh = blockIdx.x;
+    const int ki = blockIdx.y;
+    const int d  = threadIdx.x;
+    if (kh >= kInkKVHeads || ki >= K_len) return;
+    const size_t hbase = (size_t)ki * kInkKVHeads + kh;
+    uint16_t kb = bf16c_decode1_bits(st_k + hbase * kInkBf16cHeadBytes, __float_as_uint(st_ksc[hbase]), d);
+    uint16_t vb = bf16c_decode1_bits(st_v + hbase * kInkBf16cHeadBytes, __float_as_uint(st_vsc[hbase]), d);
+    if constexpr (USE_FP16) {
+        kb = pf_cvt_from_f32<true>(__uint_as_float((uint32_t)kb << 16));
+        vb = pf_cvt_from_f32<true>(__uint_as_float((uint32_t)vb << 16));
     }
     uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
     uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);

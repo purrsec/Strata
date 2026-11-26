@@ -18,6 +18,7 @@ enum class KvDtype : uint8_t {
     FP8_E4M3 = 1, // 16 KiB/tok Global (64 MiB per 4K slot!), 80 MiB max SWA-1024 -> 64 slots fit in 16-32 GB GPU!
     K8V8     = 2, // 16.5 KiB/tok Global: symmetric INT8 K & INT8 V with per-64 FP16 scales (#6520 / @merbanan)
     K8V4     = 3, // 12.75 KiB/tok Global: symmetric INT8 K + 4-bit asymmetric V with per-64 FP16 scale & min (#6520 / @merbanan)
+    BF16C    = 4, // 24.5 KiB/tok Global (0.766x): GAAC-12/LoomKV lossless BF16 exponent-packed (192B+4B/head, bit-exact 2^14 dynamic range!)
 };
 
 inline const char* kv_dtype_name(KvDtype dt) noexcept {
@@ -26,6 +27,7 @@ inline const char* kv_dtype_name(KvDtype dt) noexcept {
         case KvDtype::FP8_E4M3: return "fp8";
         case KvDtype::K8V8:     return "k8v8";
         case KvDtype::K8V4:     return "k8v4";
+        case KvDtype::BF16C:    return "bf16c";
         default:                return "fp16";
     }
 }
@@ -147,6 +149,7 @@ inline SlotMemBudget estimate_slot_bytes(int max_ctx, KvDtype kv_dtype, bool wit
     if (kv_dtype == KvDtype::FP8_E4M3) kv_tok_bytes = 2u * kv_dim;
     else if (kv_dtype == KvDtype::K8V8) kv_tok_bytes = 2u * kv_dim + 2u * (kv_dim / 64u) * 2u;
     else if (kv_dtype == KvDtype::K8V4) kv_tok_bytes = kv_dim + (kv_dim / 2u) + (kv_dim / 64u) * 2u + (kv_dim / 64u) * 4u;
+    else if (kv_dtype == KvDtype::BF16C) kv_tok_bytes = 2u * (kv_dim * 3u / 2u) + 2u * 8u * 4u;
     SlotMemBudget b;
     b.swa_kv_bytes    = 40u * swa_len * kv_tok_bytes;
     b.global_kv_bytes = 8u * static_cast<size_t>(max_ctx) * kv_tok_bytes;

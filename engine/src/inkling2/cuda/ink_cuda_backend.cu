@@ -196,6 +196,7 @@ public:
             if (d == KvDtype::FP8_E4M3) return strata::ink::InkKvDtype::FP8;
             if (d == KvDtype::K8V8)     return strata::ink::InkKvDtype::K8V8;
             if (d == KvDtype::K8V4)     return strata::ink::InkKvDtype::K8V4;
+            if (d == KvDtype::BF16C)    return strata::ink::InkKvDtype::BF16C;
             return strata::ink::InkKvDtype::FP16;
         };
         const auto cuda_kvd = map_kvd(kv_dtype_);
@@ -518,8 +519,9 @@ public:
                 copy_d2h(kv.k_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_k);
                 copy_d2h(kv.v_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_v);
             } else {
-                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : strata::ink::kInkKVDim;
-                copy_d2h(kv.k_f8, 1, strata::ink::kInkKVDim, ck.swa_k);
+                const size_t k_stride = (kv.kv_fmt == 4) ? (strata::ink::kInkKVDim * 3 / 2) : strata::ink::kInkKVDim;
+                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : k_stride;
+                copy_d2h(kv.k_f8, 1, k_stride, ck.swa_k);
                 copy_d2h(kv.v_f8, 1, v_stride, ck.swa_v);
                 copy_d2h(kv.k_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_ksc);
                 copy_d2h(kv.v_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_vsc);
@@ -607,8 +609,9 @@ public:
                 copy_h2d(kv.k_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_k, ok);
                 copy_h2d(kv.v_f16, sizeof(__half), strata::ink::kInkKVDim, ck.swa_v, ov);
             } else {
-                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : strata::ink::kInkKVDim;
-                copy_h2d(kv.k_f8, 1, strata::ink::kInkKVDim, ck.swa_k, ok);
+                const size_t k_stride = (kv.kv_fmt == 4) ? (strata::ink::kInkKVDim * 3 / 2) : strata::ink::kInkKVDim;
+                const size_t v_stride = (kv.kv_fmt == 3) ? (strata::ink::kInkKVDim / 2) : k_stride;
+                copy_h2d(kv.k_f8, 1, k_stride, ck.swa_k, ok);
                 copy_h2d(kv.v_f8, 1, v_stride, ck.swa_v, ov);
                 copy_h2d(kv.k_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_ksc, oks);
                 copy_h2d(kv.v_sc, sizeof(float), strata::ink::kInkKVHeads, ck.swa_vsc, ovs);

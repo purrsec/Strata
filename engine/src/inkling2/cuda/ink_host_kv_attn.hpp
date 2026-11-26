@@ -60,3 +60,37 @@ int ink_host_kv_select_topk_fp16(
 float ink_host_kv_min_q_cosine(const float* q_cur, const float* q_prev, int M);
 
 }  // namespace strata::ink
+
+// ---- Stage G: GAAC-12 / LoomKV Lossless BF16 Exponent-Packed KV Cache (--kv bf16c, 192B+4B/head = 0.766x!) ----
+namespace strata::ink {
+
+// Deduplicated multi-agent AVX2+FMA attention over BF16C (192B/head + 4B e_max) Host KV slabs!
+void ink_host_kv_attn_bf16c(
+    const float* q,
+    const float* rel_table,
+    const void* const* slab_raw_k,        // [n_slabs] uint8_t* [256, 256, 8, 192]
+    const void* const* slab_raw_v,        // [n_slabs] uint8_t* [256, 256, 8, 192]
+    const float* const* slab_raw_ksc,     // [n_slabs] uint32_t-in-float e_max [256, 256, 8]
+    const float* const* slab_raw_vsc,
+    const int32_t* slot_qp,
+    const InkHostKvUniqueBlock* ublocks,
+    int n_ublocks,
+    int M,
+    float* out_buf,
+    int n_threads = 0);
+
+// FreeKV/HERALD min-max summary builder & Top-K selector over BF16C Host KV slabs!
+void ink_host_kv_build_summary_bf16c(const void* slab_raw_k, const float* slab_raw_ksc, int boff, int pos_len, InkBlockSummary* out_sum);
+
+int ink_host_kv_select_topk_bf16c(
+    const float* q,
+    const void* const* slab_raw_k,
+    const float* const* slab_raw_ksc,
+    InkBlockSummary* const* slab_sums,
+    const InkHostKvUniqueBlock* ublocks,
+    int n_ublocks,
+    int M,
+    int top_k,
+    int* out_indices);
+
+}  // namespace strata::ink

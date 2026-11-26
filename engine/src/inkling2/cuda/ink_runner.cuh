@@ -1948,6 +1948,8 @@ struct InkCudaRunner {
     cudaEvent_t  ev_tide_comp_done[2] = {};
     __half*      d_tide_k[2]          = {};
     __half*      d_tide_v[2]          = {};
+    float*       d_tide_ksc[2]        = {};
+    float*       d_tide_vsc[2]        = {};
     InkStreamBlkMeta* h_tide_meta[2]  = {};
     InkStreamBlkMeta* d_tide_meta[2]  = {};
     float*       d_tide_tpm           = nullptr;
@@ -1985,15 +1987,18 @@ struct InkCudaRunner {
         ensure_slab_summaries(v);
         const int ns = (int)host_slabs[v].size();
         const void* rk[kInkMaxHostSlabs];
+        const float* rks[kInkMaxHostSlabs];
         InkBlockSummary* ss[kInkMaxHostSlabs];
         for (int si = 0; si < ns; ++si) {
-            rk[si] = host_slabs[v][si].raw_k;
-            ss[si] = host_slabs[v][si].sums.data();
+            rk[si]  = host_slabs[v][si].raw_k;
+            rks[si] = reinterpret_cast<const float*>(host_slabs[v][si].raw_ksc);
+            ss[si]  = host_slabs[v][si].sums.data();
         }
         int sel_idx[kTideTileBlks];
         const int k_cap = std::min(spec_kv_top, kTideTileBlks);
-        const int n_sel = ink_host_kv_select_topk_fp16(
-            q_src, rk, ss, spec_cand_blocks.data(), nc, M, k_cap, sel_idx);
+        const int n_sel = (kv_dtype == InkKvDtype::BF16C)
+            ? ink_host_kv_select_topk_bf16c(q_src, rk, rks, ss, spec_cand_blocks.data(), nc, M, k_cap, sel_idx)
+            : ink_host_kv_select_topk_fp16(q_src, rk, ss, spec_cand_blocks.data(), nc, M, k_cap, sel_idx);
         spec_sel_blocks.resize((size_t)n_sel);
         for (int i = 0; i < n_sel; ++i) spec_sel_blocks[i] = spec_cand_blocks[sel_idx[i]];
         // Reuse tide_enqueue_tile by temporarily swapping gpu_ublocks!
@@ -2005,18 +2010,25 @@ struct InkCudaRunner {
     bool ensure_tide_streamer() {
         if (tide_ready) return true;
         static const bool tide_on = [] { const char* e = std::getenv("STRATA_INK_TIDE_DMA"); return !(e && e[0] == '0'); }();
-        if (!tide_on || m.ls_active || kv_dtype != InkKvDtype::FP16) return false;
+        if (!tide_on || m.ls_active || (kv_dtype != InkKvDtype::FP16 && kv_dtype != InkKvDtype::BF16C)) return false;
         size_t vf = 0, vt = 0;
         const size_t kv_el = (size_t)kTideTileBlks * kInkKvBlock * kInkKVHeads * kInkHeadDim;
-        const size_t need = 4u * kv_el * sizeof(__half) + (16ull << 20);
+        const size_t sc_el = (size_t)kTideTileBlks * kInkKvBlock * kInkKVHeads;
+        const size_t kv_bytes_one = (kv_dtype == InkKvDtype::BF16C) ? (kv_el * 3u / 2u) : (kv_el * sizeof(__half));
+        const size_t sc_bytes_one = (kv_dtype == InkKvDtype::BF16C) ? (sc_el * sizeof(float)) : 0u;
+        const size_t need = 4u * (kv_bytes_one + sc_bytes_one) + (16ull << 20);
         if (ink_cuda_mem_info(&vf, &vt, m.primary_gpu) != cudaSuccess || vf < need + (128ull << 20)) return false;
         INK_CK(cudaStreamCreateWithFlags(&st_dma, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
             INK_CK(cudaEventCreateWithFlags(&ev_tide_dma_done[b], cudaEventDisableTiming));
             INK_CK(cudaEventCreateWithFlags(&ev_tide_comp_done[b], cudaEventDisableTiming));
             INK_CK(cudaEventRecord(ev_tide_comp_done[b], st));
-            d_tide_k[b]    = dalloc<__half>(kv_el);
-            d_tide_v[b]    = dalloc<__half>(kv_el);
+            d_tide_k[b]    = reinterpret_cast<__half*>(dalloc<uint8_t>(kv_bytes_one));
+            d_tide_v[b]    = reinterpret_cast<__half*>(dalloc<uint8_t>(kv_bytes_one));
+            if (kv_dtype == InkKvDtype::BF16C) {
+                d_tide_ksc[b] = dalloc<float>(sc_el);
+                d_tide_vsc[b] = dalloc<float>(sc_el);
+            }
             h_tide_meta[b] = halloc_pinned<InkStreamBlkMeta>(kTideTileBlks);
             d_tide_meta[b] = dalloc<InkStreamBlkMeta>(kTideTileBlks);
         }
@@ -2025,8 +2037,8 @@ struct InkCudaRunner {
         d_tide_tpl = dalloc<float>(tsp);
         d_tide_tpo = dalloc<float>(tsp * kInkHeadDim);
         tide_ready = true;
-        std::fprintf(stderr, "[InkTideCache] Layer-Wise Async PCIe Gen4 DMA Streamer ON: 2 x %d blocks (%d tok/tile, %.1f MiB VRAM)\n",
-                     kTideTileBlks, kTideTileBlks * kInkKvBlock, (double)(4u * kv_el * sizeof(__half)) / 1048576.0);
+        std::fprintf(stderr, "[InkTideCache] Layer-Wise Async PCIe Gen4 DMA Streamer ON (kv_fmt=%d): 2 x %d blocks (%d tok/tile, %.1f MiB VRAM)\n",
+                     (int)kv_dtype, kTideTileBlks, kTideTileBlks * kInkKvBlock, (double)(4u * (kv_bytes_one + sc_bytes_one)) / 1048576.0);
         return true;
     }
 
@@ -2035,7 +2047,8 @@ struct InkCudaRunner {
         if (!tide_ready || cnt <= 0) return;
         INK_CK(cudaStreamWaitEvent(st_dma, ev_tide_comp_done[buf], 0));
         const size_t blk_el = (size_t)kInkKvBlock * kInkKVHeads * kInkHeadDim;
-        const size_t blk_b  = blk_el * sizeof(__half);
+        const size_t blk_sc = (size_t)kInkKvBlock * kInkKVHeads;
+        const size_t blk_b  = (kv_dtype == InkKvDtype::BF16C) ? (blk_el * 3u / 2u) : (blk_el * sizeof(__half));
         int i = 0;
         while (i < cnt) {
             const auto& u0 = gpu_ublocks[blk_beg + i];
@@ -2046,10 +2059,16 @@ struct InkCudaRunner {
                 else break;
             }
             const auto& hs = host_slabs[visit][u0.slab];
-            const __half* sk = reinterpret_cast<const __half*>(hs.raw_k) + (size_t)u0.boff * blk_el;
-            const __half* sv = reinterpret_cast<const __half*>(hs.raw_v) + (size_t)u0.boff * blk_el;
-            INK_CK(cudaMemcpyAsync(d_tide_k[buf] + (size_t)i * blk_el, sk, (size_t)run * blk_b, cudaMemcpyHostToDevice, st_dma));
-            INK_CK(cudaMemcpyAsync(d_tide_v[buf] + (size_t)i * blk_el, sv, (size_t)run * blk_b, cudaMemcpyHostToDevice, st_dma));
+            const uint8_t* sk = reinterpret_cast<const uint8_t*>(hs.raw_k) + (size_t)u0.boff * blk_b;
+            const uint8_t* sv = reinterpret_cast<const uint8_t*>(hs.raw_v) + (size_t)u0.boff * blk_b;
+            INK_CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_tide_k[buf]) + (size_t)i * blk_b, sk, (size_t)run * blk_b, cudaMemcpyHostToDevice, st_dma));
+            INK_CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_tide_v[buf]) + (size_t)i * blk_b, sv, (size_t)run * blk_b, cudaMemcpyHostToDevice, st_dma));
+            if (kv_dtype == InkKvDtype::BF16C) {
+                const float* sks = reinterpret_cast<const float*>(hs.raw_ksc) + (size_t)u0.boff * blk_sc;
+                const float* svs = reinterpret_cast<const float*>(hs.raw_vsc) + (size_t)u0.boff * blk_sc;
+                INK_CK(cudaMemcpyAsync(d_tide_ksc[buf] + (size_t)i * blk_sc, sks, (size_t)run * blk_sc * sizeof(float), cudaMemcpyHostToDevice, st_dma));
+                INK_CK(cudaMemcpyAsync(d_tide_vsc[buf] + (size_t)i * blk_sc, svs, (size_t)run * blk_sc * sizeof(float), cudaMemcpyHostToDevice, st_dma));
+            }
             for (int r = 0; r < run; ++r) {
                 const auto& ur = gpu_ublocks[blk_beg + i + r];
                 h_tide_meta[buf][i + r] = {ur.pos_start, ur.max_pos_len, ur.slot_mask, 0u};
@@ -2065,7 +2084,7 @@ struct InkCudaRunner {
         step_cpu_need_rt = false;
         step_tide_active = false;
         static const bool cpu_hk_on = [] { const char* e = std::getenv("STRATA_INK_CPU_HOST_KV"); return !(e && e[0] == '0'); }();
-        if (!cpu_hk_on || !paged_kv_active || kv_dtype != InkKvDtype::FP16 || kv_host_slabs <= 0 || M <= 0 || M > kCpuHostMaxM || m.ls_active) {
+        if (!cpu_hk_on || !paged_kv_active || (kv_dtype != InkKvDtype::FP16 && kv_dtype != InkKvDtype::BF16C) || kv_host_slabs <= 0 || M <= 0 || M > kCpuHostMaxM || m.ls_active) {
             return false;
         }
         const int max_host_blks = kv_host_slabs * kInkSlabBlocks;
@@ -2206,8 +2225,9 @@ struct InkCudaRunner {
                 hs.dev_k = dk; hs.dev_v = dv;
             } else {
                 uint8_t *dk = nullptr, *dv = nullptr;
-                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : elems;
-                ok = alloc_mapped_host<uint8_t>(elems, hs.raw_k, dk) && alloc_mapped_host<uint8_t>(vb, hs.raw_v, dv)
+                const size_t kb = (kv_dtype == InkKvDtype::BF16C) ? (elems * 3u / 2u) : elems;
+                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : kb;
+                ok = alloc_mapped_host<uint8_t>(kb, hs.raw_k, dk) && alloc_mapped_host<uint8_t>(vb, hs.raw_v, dv)
                   && alloc_mapped_host<float>(sc_n, hs.raw_ksc, hs.dev_ksc) && alloc_mapped_host<float>(sc_n, hs.raw_vsc, hs.dev_vsc);
                 hs.dev_k = dk; hs.dev_v = dv;
             }
@@ -2332,8 +2352,10 @@ struct InkCudaRunner {
                 const size_t off = (size_t)phys * blk_el;
                 if (kv_dtype == InkKvDtype::FP16) { pk = kv_desc[v].k_f16 + off; pv = kv_desc[v].v_f16 + off; pksc = pvsc = nullptr; }
                 else {
-                    pk = kv_desc[v].k_f8 + off;
-                    pv = kv_desc[v].v_f8 + ((kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : off);
+                    const size_t koff = (kv_dtype == InkKvDtype::BF16C) ? (off * 3u / 2u) : off;
+                    const size_t voff = (kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : koff;
+                    pk = kv_desc[v].k_f8 + koff;
+                    pv = kv_desc[v].v_f8 + voff;
                     pksc = kv_desc[v].k_sc + (size_t)phys * blk_sc;
                     pvsc = kv_desc[v].v_sc + (size_t)phys * blk_sc;
                 }
@@ -2348,8 +2370,10 @@ struct InkCudaRunner {
                     pv = reinterpret_cast<__half*>(hs.dev_v) + off;
                     pksc = pvsc = nullptr;
                 } else {
-                    pk = reinterpret_cast<uint8_t*>(hs.dev_k) + off;
-                    pv = reinterpret_cast<uint8_t*>(hs.dev_v) + ((kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : off);
+                    const size_t koff = (kv_dtype == InkKvDtype::BF16C) ? (off * 3u / 2u) : off;
+                    const size_t voff = (kv_dtype == InkKvDtype::K8V4) ? (off / 2u) : koff;
+                    pk = reinterpret_cast<uint8_t*>(hs.dev_k) + koff;
+                    pv = reinterpret_cast<uint8_t*>(hs.dev_v) + voff;
                     pksc = hs.dev_ksc + (size_t)bo * blk_sc;
                     pvsc = hs.dev_vsc + (size_t)bo * blk_sc;
                 }
@@ -2375,8 +2399,9 @@ struct InkCudaRunner {
                 INK_CK(cudaMemcpyAsync(dk, sk, blk_el * sizeof(__half), cudaMemcpyDeviceToDevice, st));
                 INK_CK(cudaMemcpyAsync(dv, sv, blk_el * sizeof(__half), cudaMemcpyDeviceToDevice, st));
             } else {
-                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (blk_el / 2u) : blk_el;
-                INK_CK(cudaMemcpyAsync(dk, sk, blk_el, cudaMemcpyDeviceToDevice, st));
+                const size_t kb = (kv_dtype == InkKvDtype::BF16C) ? (blk_el * 3u / 2u) : blk_el;
+                const size_t vb = (kv_dtype == InkKvDtype::K8V4) ? (blk_el / 2u) : kb;
+                INK_CK(cudaMemcpyAsync(dk, sk, kb, cudaMemcpyDeviceToDevice, st));
                 INK_CK(cudaMemcpyAsync(dv, sv, vb, cudaMemcpyDeviceToDevice, st));
                 INK_CK(cudaMemcpyAsync(dks, sks, blk_sc * sizeof(float), cudaMemcpyDeviceToDevice, st));
                 INK_CK(cudaMemcpyAsync(dvs, svs, blk_sc * sizeof(float), cudaMemcpyDeviceToDevice, st));
@@ -2652,8 +2677,9 @@ struct InkCudaRunner {
     }
 
     static size_t kv_bytes_per_visit_pos(InkKvDtype dt) noexcept {
-        if (dt == InkKvDtype::FP16) return (size_t)kInkKVDim * 4u;
-        if (dt == InkKvDtype::K8V4) return (size_t)kInkKVDim + ((size_t)kInkKVDim / 2u) + (size_t)(2 * kInkKVHeads * 4);
+        if (dt == InkKvDtype::FP16)  return (size_t)kInkKVDim * 4u;
+        if (dt == InkKvDtype::BF16C) return (size_t)kInkKVDim * 3u + (size_t)(2 * kInkKVHeads * 4);  // 3136 B = 0.766x FP16!
+        if (dt == InkKvDtype::K8V4)  return (size_t)kInkKVDim + ((size_t)kInkKVDim / 2u) + (size_t)(2 * kInkKVHeads * 4);
         return (size_t)kInkKVDim * 2u + (size_t)(2 * kInkKVHeads * 4);  // FP8 or K8V8
     }
 
@@ -2954,8 +2980,9 @@ struct InkCudaRunner {
                         kv_desc[v].k_f16 = dalloc<__half>(elems);
                         kv_desc[v].v_f16 = dalloc<__half>(elems);
                     } else {
-                        kv_desc[v].k_f8 = dalloc<uint8_t>(elems);
-                        kv_desc[v].v_f8 = dalloc<uint8_t>((kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : elems);
+                        const size_t kb = (kv_dtype == InkKvDtype::BF16C) ? (elems * 3u / 2u) : elems;
+                        kv_desc[v].k_f8 = dalloc<uint8_t>(kb);
+                        kv_desc[v].v_f8 = dalloc<uint8_t>((kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : kb);
                         kv_desc[v].k_sc = dalloc<float>(sc_n);
                         kv_desc[v].v_sc = dalloc<float>(sc_n);
                     }
@@ -2967,8 +2994,9 @@ struct InkCudaRunner {
                     kv_desc[v].k_f16 = dalloc<__half>(elems);
                     kv_desc[v].v_f16 = dalloc<__half>(elems);
                 } else {
-                    kv_desc[v].k_f8 = dalloc<uint8_t>(elems);
-                    kv_desc[v].v_f8 = dalloc<uint8_t>((kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : elems);
+                    const size_t kb = (kv_dtype == InkKvDtype::BF16C) ? (elems * 3u / 2u) : elems;
+                    kv_desc[v].k_f8 = dalloc<uint8_t>(kb);
+                    kv_desc[v].v_f8 = dalloc<uint8_t>((kv_dtype == InkKvDtype::K8V4) ? (elems / 2u) : kb);
                     kv_desc[v].k_sc = dalloc<float>((size_t)max_slots * dcap * kInkKVHeads);
                     kv_desc[v].v_sc = dalloc<float>((size_t)max_slots * dcap * kInkKVHeads);
                 }
@@ -4106,9 +4134,17 @@ struct InkCudaRunner {
                     if (cnt > 0) {
                         INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[buf], 0));
                         const int nsp_t = std::min(kTideTileSplits, std::max(1, cnt));
-                        k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
-                            d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
-                            cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                        if (kv_dtype == InkKvDtype::BF16C) {
+                            k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                d_q, d_rel_table, d_pos,
+                                reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                        } else {
+                            k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
+                                cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                        }
                         k_ink_flash_gqa_tide_accum<<<dim3(kInkHeads, M), 128, 0, st>>>(
                             d_tide_tpm, d_tide_tpl, d_tide_tpo, d_attn_pm, d_attn_pl, d_attn_po,
                             M, nsp_t, n_sp_tot, tide_sp, 1);
@@ -4120,10 +4156,22 @@ struct InkCudaRunner {
                         const int ns = (int)host_slabs[visit].size();
                         const void* rk[kInkMaxHostSlabs];
                         const void* rv[kInkMaxHostSlabs];
-                        for (int si = 0; si < ns; ++si) { rk[si] = host_slabs[visit][si].raw_k; rv[si] = host_slabs[visit][si].raw_v; }
-                        ink_host_kv_attn_fp16(
-                            h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
-                            rk, rv, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        const float* rks[kInkMaxHostSlabs];
+                        const float* rvs[kInkMaxHostSlabs];
+                        for (int si = 0; si < ns; ++si) {
+                            rk[si] = host_slabs[visit][si].raw_k; rv[si] = host_slabs[visit][si].raw_v;
+                            rks[si] = reinterpret_cast<const float*>(host_slabs[visit][si].raw_ksc);
+                            rvs[si] = reinterpret_cast<const float*>(host_slabs[visit][si].raw_vsc);
+                        }
+                        if (kv_dtype == InkKvDtype::BF16C) {
+                            ink_host_kv_attn_bf16c(
+                                h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
+                                rk, rv, rks, rvs, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        } else {
+                            ink_host_kv_attn_fp16(
+                                h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
+                                rk, rv, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        }
                         INK_CK(cudaMemcpyAsync(d_cpu_split, h_cpu_split_pin, (size_t)M * kInkHeads * 130 * sizeof(float), cudaMemcpyHostToDevice, st));
                         k_ink_attn_inject_split<<<dim3(kInkHeads, M), 128, 0, st>>>(
                             d_cpu_split, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_tot, cpu_sp);
@@ -4187,9 +4235,17 @@ struct InkCudaRunner {
                             }
                             INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[buf], 0));
                             const int nsp_t = std::min(kTideTileSplits, std::max(1, cnt));
-                            k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
-                                d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
-                                cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            if (kv_dtype == InkKvDtype::BF16C) {
+                                k_ink_flash_gqa_tide_tile_bf16c<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                    d_q, d_rel_table, d_pos,
+                                    reinterpret_cast<const uint8_t*>(d_tide_k[buf]), reinterpret_cast<const uint8_t*>(d_tide_v[buf]),
+                                    d_tide_ksc[buf], d_tide_vsc[buf], d_tide_meta[buf],
+                                    cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            } else {
+                                k_ink_flash_gqa_tide_tile<<<dim3(kInkKVHeads, nsp_t, M), 128, 0, st>>>(
+                                    d_q, d_rel_table, d_pos, d_tide_k[buf], d_tide_v[buf], d_tide_meta[buf],
+                                    cnt, d_tide_tpm, d_tide_tpl, d_tide_tpo, M, nsp_t);
+                            }
                             k_ink_flash_gqa_tide_accum<<<dim3(kInkHeads, M), 128, 0, st>>>(
                                 d_tide_tpm, d_tide_tpl, d_tide_tpo, d_attn_pm, d_attn_pl, d_attn_po,
                                 M, nsp_t, n_sp_tot, tide_sp, ti == 0 ? 1 : 0);
@@ -4203,13 +4259,23 @@ struct InkCudaRunner {
                         const int ns = (int)host_slabs[visit].size();
                         const void* rk[kInkMaxHostSlabs];
                         const void* rv[kInkMaxHostSlabs];
+                        const float* rks[kInkMaxHostSlabs];
+                        const float* rvs[kInkMaxHostSlabs];
                         for (int si = 0; si < ns; ++si) {
                             rk[si] = host_slabs[visit][si].raw_k;
                             rv[si] = host_slabs[visit][si].raw_v;
+                            rks[si] = reinterpret_cast<const float*>(host_slabs[visit][si].raw_ksc);
+                            rvs[si] = reinterpret_cast<const float*>(host_slabs[visit][si].raw_vsc);
                         }
-                        ink_host_kv_attn_fp16(
-                            h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
-                            rk, rv, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        if (kv_dtype == InkKvDtype::BF16C) {
+                            ink_host_kv_attn_bf16c(
+                                h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
+                                rk, rv, rks, rvs, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        } else {
+                            ink_host_kv_attn_fp16(
+                                h_cpu_q_pin, step_cpu_need_rt ? h_cpu_rt_pin : nullptr,
+                                rk, rv, cpu_slot_qp, cpu_ublocks.data(), (int)cpu_ublocks.size(), M, h_cpu_split_pin);
+                        }
                         INK_CK(cudaMemcpyAsync(d_cpu_split, h_cpu_split_pin, (size_t)M * kInkHeads * 130 * sizeof(float), cudaMemcpyHostToDevice, st));
                         k_ink_attn_inject_split<<<dim3(kInkHeads, M), 128, 0, st>>>(
                             d_cpu_split, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp_tot, cpu_sp);
@@ -4280,7 +4346,7 @@ struct InkCudaRunner {
                     float* d_alpha_tmp = d_ctrl_gain;
                     k_ink_pf_online_init<<<dim3(kInkHeads, M), 128, 0, st>>>(d_sinks, d_pf_m, d_pf_l, d_pf_o, 0, M);
                     const int k_end_all = p0_val + M;
-                    const bool pf_dma_ok = paged_kv_active && kv_dtype == InkKvDtype::FP16 && kv_host_slabs > 0 && ensure_tide_streamer();
+                    const bool pf_dma_ok = paged_kv_active && (kv_dtype == InkKvDtype::FP16 || kv_dtype == InkKvDtype::BF16C) && kv_host_slabs > 0 && ensure_tide_streamer();
                     if (pf_dma_ok) INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[0], 0));
                     for (int kt = k_start; kt < k_end_all; kt += kInkPfKvTile) {
                         const int K_t = std::min(kInkPfKvTile, k_end_all - kt);
@@ -4294,7 +4360,8 @@ struct InkCudaRunner {
                             for (int bi = 0; all_host && bi < nb; ++bi) if (pt[b0 + bi] < kv_dev_blocks) all_host = false;
                             if (all_host) {
                                 const size_t blk_el = (size_t)kInkKvBlock * kInkKVHeads * kInkHeadDim;
-                                const size_t blk_b  = blk_el * sizeof(__half);
+                                const size_t blk_sc = (size_t)kInkKvBlock * kInkKVHeads;
+                                const size_t blk_b  = (kv_dtype == InkKvDtype::BF16C) ? (blk_el * 3u / 2u) : (blk_el * sizeof(__half));
                                 int i = 0;
                                 while (i < nb) {
                                     const int hi0 = pt[b0 + i] - kv_dev_blocks;
@@ -4306,14 +4373,25 @@ struct InkCudaRunner {
                                         else break;
                                     }
                                     const auto& hs = host_slabs[visit][sl0];
-                                    const __half* sk = reinterpret_cast<const __half*>(hs.raw_k) + (size_t)bo0 * blk_el;
-                                    const __half* sv = reinterpret_cast<const __half*>(hs.raw_v) + (size_t)bo0 * blk_el;
-                                    INK_CK(cudaMemcpyAsync(d_tide_k[0] + (size_t)i * blk_el, sk, (size_t)run * blk_b, cudaMemcpyHostToDevice, st));
-                                    INK_CK(cudaMemcpyAsync(d_tide_v[0] + (size_t)i * blk_el, sv, (size_t)run * blk_b, cudaMemcpyHostToDevice, st));
+                                    const uint8_t* sk = reinterpret_cast<const uint8_t*>(hs.raw_k) + (size_t)bo0 * blk_b;
+                                    const uint8_t* sv = reinterpret_cast<const uint8_t*>(hs.raw_v) + (size_t)bo0 * blk_b;
+                                    INK_CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_tide_k[0]) + (size_t)i * blk_b, sk, (size_t)run * blk_b, cudaMemcpyHostToDevice, st));
+                                    INK_CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_tide_v[0]) + (size_t)i * blk_b, sv, (size_t)run * blk_b, cudaMemcpyHostToDevice, st));
+                                    if (kv_dtype == InkKvDtype::BF16C) {
+                                        const float* sks = reinterpret_cast<const float*>(hs.raw_ksc) + (size_t)bo0 * blk_sc;
+                                        const float* svs = reinterpret_cast<const float*>(hs.raw_vsc) + (size_t)bo0 * blk_sc;
+                                        INK_CK(cudaMemcpyAsync(d_tide_ksc[0] + (size_t)i * blk_sc, sks, (size_t)run * blk_sc * sizeof(float), cudaMemcpyHostToDevice, st));
+                                        INK_CK(cudaMemcpyAsync(d_tide_vsc[0] + (size_t)i * blk_sc, svs, (size_t)run * blk_sc * sizeof(float), cudaMemcpyHostToDevice, st));
+                                    }
                                     i += run;
                                 }
-                                if (use_fp16_pf) k_ink_pf_pack_kv_staged<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(d_tide_k[0], d_tide_v[0], K_t, d_pf_k, d_pf_v);
-                                else             k_ink_pf_pack_kv_staged<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(d_tide_k[0], d_tide_v[0], K_t, d_pf_k, d_pf_v);
+                                if (kv_dtype == InkKvDtype::BF16C) {
+                                    if (use_fp16_pf) k_ink_pf_pack_kv_staged_bf16c<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(reinterpret_cast<const uint8_t*>(d_tide_k[0]), reinterpret_cast<const uint8_t*>(d_tide_v[0]), d_tide_ksc[0], d_tide_vsc[0], K_t, d_pf_k, d_pf_v);
+                                    else             k_ink_pf_pack_kv_staged_bf16c<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(reinterpret_cast<const uint8_t*>(d_tide_k[0]), reinterpret_cast<const uint8_t*>(d_tide_v[0]), d_tide_ksc[0], d_tide_vsc[0], K_t, d_pf_k, d_pf_v);
+                                } else {
+                                    if (use_fp16_pf) k_ink_pf_pack_kv_staged<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(d_tide_k[0], d_tide_v[0], K_t, d_pf_k, d_pf_v);
+                                    else             k_ink_pf_pack_kv_staged<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(d_tide_k[0], d_tide_v[0], K_t, d_pf_k, d_pf_v);
+                                }
                                 used_pf_dma = true;
                             }
                         }
@@ -5045,6 +5123,8 @@ struct InkCudaRunner {
             if (ev_tide_comp_done[b]) { cudaEventDestroy(ev_tide_comp_done[b]); ev_tide_comp_done[b] = nullptr; }
             if (d_tide_k[b])    { cudaFree(d_tide_k[b]); d_tide_k[b] = nullptr; }
             if (d_tide_v[b])    { cudaFree(d_tide_v[b]); d_tide_v[b] = nullptr; }
+            if (d_tide_ksc[b])  { cudaFree(d_tide_ksc[b]); d_tide_ksc[b] = nullptr; }
+            if (d_tide_vsc[b])  { cudaFree(d_tide_vsc[b]); d_tide_vsc[b] = nullptr; }
             if (d_tide_meta[b]) { cudaFree(d_tide_meta[b]); d_tide_meta[b] = nullptr; }
             if (h_tide_meta[b]) { cudaFreeHost(h_tide_meta[b]); h_tide_meta[b] = nullptr; }
         }

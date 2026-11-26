@@ -557,6 +557,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         if (kd == KvDtype::FP8_E4M3) return "fp8";
         if (kd == KvDtype::K8V8)     return "k8v8";
         if (kd == KvDtype::K8V4)     return "k8v4";
+        if (kd == KvDtype::BF16C)    return "bf16c";
         return "fp16";
     }();
     proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 shared_prefix=%d kv_dtype=%s drafter=%s drafting=%s images=%d image_pad=%d parallel=%d ckpt_key=1",

@@ -636,3 +636,397 @@ int ink_host_kv_select_topk_fp16(
 }
 
 }  // namespace strata::ink
+
+// ---- Stage G: GAAC-12 / LoomKV Lossless BF16 Exponent-Packed KV Cache (--kv bf16c, 192B+4B/head) ----
+namespace strata::ink {
+
+namespace {
+
+constexpr int kBf16cHeadBytes = 192;  // 128 B [sign|mant7] + 64 B [4-bit exp delta]
+
+static inline void bf16c_decode128_avx2(const uint8_t* head192, uint32_t e_max, float* dst128) noexcept {
+    const uint8_t* sm_p = head192;
+    const uint8_t* ex_p = head192 + 128;
+    const __m256i v_emax  = _mm256_set1_epi32((int)e_max);
+    const __m256i v_15    = _mm256_set1_epi32(15);
+    const __m256i v_80    = _mm256_set1_epi32(0x80);
+    const __m256i v_7f    = _mm256_set1_epi32(0x7F);
+    const __m256i v_0f    = _mm256_set1_epi32(0x0F);
+    const __m256i v_shuf  = _mm256_setr_epi8(
+        0, -1, -1, -1, 0, -1, -1, -1, 1, -1, -1, -1, 1, -1, -1, -1,
+        2, -1, -1, -1, 2, -1, -1, -1, 3, -1, -1, -1, 3, -1, -1, -1);
+    const __m256i v_shift = _mm256_setr_epi32(0, 4, 0, 4, 0, 4, 0, 4);
+
+    for (int d = 0; d < kHeadDim; d += 8) {
+        // Load 8 sign+mantissa bytes -> 8 int32 lanes
+        __m128i sm8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(sm_p + d));
+        __m256i sm  = _mm256_cvtepu8_epi32(sm8);
+        // Load 4 packed exponent-delta bytes -> duplicate each byte into two int32 lanes, shift odd lanes by 4!
+        uint32_t ex4;
+        std::memcpy(&ex4, ex_p + (d >> 1), 4);
+        __m128i ex_lo = _mm_cvtsi32_si128((int)ex4);
+        __m256i ex_b  = _mm256_broadcastsi128_si256(ex_lo);
+        __m256i ex_u  = _mm256_shuffle_epi8(ex_b, v_shuf);
+        __m256i nib   = _mm256_and_si256(_mm256_srlv_epi32(ex_u, v_shift), v_0f);
+        // Reconstruct exact BF16 bits: ((sm & 0x80) << 8) | ((e_max - nib) << 7) | (sm & 0x7F), masked to 0 if nib == 15
+        __m256i is_z  = _mm256_cmpeq_epi32(nib, v_15);
+        __m256i sgn   = _mm256_slli_epi32(_mm256_and_si256(sm, v_80), 8);
+        __m256i exp   = _mm256_slli_epi32(_mm256_sub_epi32(v_emax, nib), 7);
+        __m256i mnt   = _mm256_and_si256(sm, v_7f);
+        __m256i bf    = _mm256_andnot_si256(is_z, _mm256_or_si256(_mm256_or_si256(sgn, exp), mnt));
+        __m256  vf    = _mm256_castsi256_ps(_mm256_slli_epi32(bf, 16));
+        _mm256_store_ps(dst128 + d, vf);
+    }
+}
+
+struct HostAttnBf16cPool {
+    struct Job {
+        const float* q = nullptr;
+        const float* rel_table = nullptr;
+        const void* const* slab_k = nullptr;
+        const void* const* slab_v = nullptr;
+        const float* const* slab_ksc = nullptr;
+        const float* const* slab_vsc = nullptr;
+        const int32_t* slot_qp = nullptr;
+        const InkHostKvUniqueBlock* ublocks = nullptr;
+        int n_ublocks = 0;
+        int M = 0;
+        int n_thr = 1;
+        float* thr_out = nullptr;
+    };
+
+    static void run_slice(const Job& job, int tid) noexcept {
+        const int M = job.M;
+        const int n_thr = job.n_thr;
+        float* my_base = job.thr_out + (size_t)tid * M * kHeads * 130;
+
+        for (int m = 0; m < M; ++m) {
+            for (int h = 0; h < kHeads; ++h) {
+                float* dst = my_base + ((size_t)m * kHeads + h) * 130;
+                std::memset(dst, 0, kHeadDim * sizeof(float));
+                dst[128] = -1e30f;
+                dst[129] = 0.0f;
+            }
+        }
+
+        const int ub_per = (job.n_ublocks + n_thr - 1) / n_thr;
+        const int ub_beg = tid * ub_per;
+        const int ub_end = std::min(job.n_ublocks, ub_beg + ub_per);
+        if (ub_beg >= ub_end) return;
+
+        alignas(32) float qs[kMaxM][kHeads][kHeadDim];
+        const __m256 vsc = _mm256_set1_ps(kScale);
+        for (int m = 0; m < M; ++m) {
+            const float* qm = job.q + (size_t)m * kHeads * kHeadDim;
+            for (int h = 0; h < kHeads; ++h) {
+                const float* qh = qm + (size_t)h * kHeadDim;
+                float* qsh = qs[m][h];
+                for (int d = 0; d < kHeadDim; d += 8) {
+                    _mm256_store_ps(qsh + d, _mm256_mul_ps(_mm256_loadu_ps(qh + d), vsc));
+                }
+            }
+        }
+
+        alignas(32) float o_loc[kMaxM][kHeads][kHeadDim];
+        float m_loc[kMaxM][kHeads];
+        float l_loc[kMaxM][kHeads];
+        for (int m = 0; m < M; ++m) {
+            std::memset(o_loc[m], 0, sizeof(o_loc[m]));
+            for (int h = 0; h < kHeads; ++h) { m_loc[m][h] = -1e30f; l_loc[m][h] = 0.0f; }
+        }
+
+        alignas(32) float kf[kHeadDim];
+        alignas(32) float vf[kHeadDim];
+
+        for (int bi = ub_beg; bi < ub_end; ++bi) {
+            const InkHostKvUniqueBlock ub = job.ublocks[bi];
+            const uint32_t mask = ub.slot_mask;
+            if (!mask) continue;
+
+            int ms[kMaxM], nm = 0;
+            uint32_t tmp = mask;
+            while (tmp) { int m = __builtin_ctz(tmp); tmp &= (tmp - 1u); if (m < M) ms[nm++] = m; }
+            if (nm == 0) continue;
+
+            const uint8_t* sk   = reinterpret_cast<const uint8_t*>(job.slab_k[ub.slab])
+                                + (size_t)ub.boff * kBlockTok * kKVHeads * kBf16cHeadBytes;
+            const uint8_t* sv   = reinterpret_cast<const uint8_t*>(job.slab_v[ub.slab])
+                                + (size_t)ub.boff * kBlockTok * kKVHeads * kBf16cHeadBytes;
+            const uint32_t* sks = reinterpret_cast<const uint32_t*>(job.slab_ksc[ub.slab])
+                                + (size_t)ub.boff * kBlockTok * kKVHeads;
+            const uint32_t* svs = reinterpret_cast<const uint32_t*>(job.slab_vsc[ub.slab])
+                                + (size_t)ub.boff * kBlockTok * kKVHeads;
+
+            bool any_rel = false;
+            if (job.rel_table != nullptr) {
+                for (int k = 0; k < nm; ++k) {
+                    if ((job.slot_qp[ms[k]] - (ub.pos_start + ub.max_pos_len - 1)) < kRelExt) { any_rel = true; break; }
+                }
+            }
+
+            for (int t = 0; t < ub.max_pos_len; ++t) {
+                const int kp = ub.pos_start + t;
+                const uint8_t* kt_base = sk + (size_t)t * kKVHeads * kBf16cHeadBytes;
+                const uint8_t* vt_base = sv + (size_t)t * kKVHeads * kBf16cHeadBytes;
+                const uint32_t* ks_row = sks + (size_t)t * kKVHeads;
+                const uint32_t* vs_row = svs + (size_t)t * kKVHeads;
+
+                if (t + 2 < ub.max_pos_len) {
+                    _mm_prefetch(reinterpret_cast<const char*>(sk + (size_t)(t + 2) * kKVHeads * kBf16cHeadBytes), _MM_HINT_T0);
+                }
+
+                for (int kh = 0; kh < kKVHeads; ++kh) {
+                    const int h0 = 3 * kh;
+                    bf16c_decode128_avx2(kt_base + (size_t)kh * kBf16cHeadBytes, ks_row[kh], kf);
+
+                    float al_arr[kMaxM][3], pv_arr[kMaxM][3];
+                    uint8_t act_arr[kMaxM];
+                    bool any_v = false;
+
+                    for (int k = 0; k < nm; ++k) {
+                        const int m = ms[k];
+                        const int qp = job.slot_qp[m];
+                        if (kp > qp) { act_arr[k] = 0; continue; }
+
+                        const float* q0 = qs[m][h0 + 0];
+                        const float* q1 = qs[m][h0 + 1];
+                        const float* q2 = qs[m][h0 + 2];
+                        __m256 d0a = _mm256_setzero_ps(), d0b = _mm256_setzero_ps();
+                        __m256 d1a = _mm256_setzero_ps(), d1b = _mm256_setzero_ps();
+                        __m256 d2a = _mm256_setzero_ps(), d2b = _mm256_setzero_ps();
+                        for (int d = 0; d < kHeadDim; d += 16) {
+                            __m256 k0 = _mm256_load_ps(kf + d);
+                            __m256 k1 = _mm256_load_ps(kf + d + 8);
+                            d0a = _mm256_fmadd_ps(_mm256_load_ps(q0 + d),     k0, d0a);
+                            d0b = _mm256_fmadd_ps(_mm256_load_ps(q0 + d + 8), k1, d0b);
+                            d1a = _mm256_fmadd_ps(_mm256_load_ps(q1 + d),     k0, d1a);
+                            d1b = _mm256_fmadd_ps(_mm256_load_ps(q1 + d + 8), k1, d1b);
+                            d2a = _mm256_fmadd_ps(_mm256_load_ps(q2 + d),     k0, d2a);
+                            d2b = _mm256_fmadd_ps(_mm256_load_ps(q2 + d + 8), k1, d2b);
+                        }
+                        float sc[3] = {
+                            hsum256(_mm256_add_ps(d0a, d0b)),
+                            hsum256(_mm256_add_ps(d1a, d1b)),
+                            hsum256(_mm256_add_ps(d2a, d2b))
+                        };
+                        if (any_rel && (qp - kp) < kRelExt) {
+                            const int dist = qp - kp;
+                            const float* rtm = job.rel_table + (size_t)m * kHeads * (kRelExt + 1);
+                            sc[0] += rtm[(size_t)(h0 + 0) * (kRelExt + 1) + dist];
+                            sc[1] += rtm[(size_t)(h0 + 1) * (kRelExt + 1) + dist];
+                            sc[2] += rtm[(size_t)(h0 + 2) * (kRelExt + 1) + dist];
+                        }
+
+                        uint8_t am = 0;
+                        for (int r = 0; r < 3; ++r) {
+                            const int h = h0 + r;
+                            const float mn = (sc[r] > m_loc[m][h]) ? sc[r] : m_loc[m][h];
+                            const float al = std::exp(m_loc[m][h] - mn);
+                            const float pv = std::exp(sc[r] - mn);
+                            l_loc[m][h] = l_loc[m][h] * al + pv;
+                            m_loc[m][h] = mn;
+                            al_arr[k][r] = al;
+                            pv_arr[k][r] = pv;
+                            if ((al != 1.0f) || (pv > l_loc[m][h] * 1e-10f)) am |= (uint8_t)(1u << r);
+                        }
+                        act_arr[k] = am;
+                        if (am) any_v = true;
+                    }
+
+                    if (!any_v) continue;
+                    bf16c_decode128_avx2(vt_base + (size_t)kh * kBf16cHeadBytes, vs_row[kh], vf);
+                    for (int k = 0; k < nm; ++k) {
+                        const uint8_t am = act_arr[k];
+                        if (!am) continue;
+                        const int m = ms[k];
+                        for (int r = 0; r < 3; ++r) {
+                            if (!(am & (1u << r))) continue;
+                            const __m256 va = _mm256_set1_ps(al_arr[k][r]);
+                            const __m256 vp = _mm256_set1_ps(pv_arr[k][r]);
+                            float* om = o_loc[m][h0 + r];
+                            for (int d = 0; d < kHeadDim; d += 8) {
+                                __m256 vv = _mm256_load_ps(vf + d);
+                                _mm256_store_ps(om + d, _mm256_fmadd_ps(vp, vv, _mm256_mul_ps(_mm256_load_ps(om + d), va)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int m = 0; m < M; ++m) {
+            for (int h = 0; h < kHeads; ++h) {
+                float* dst = my_base + ((size_t)m * kHeads + h) * 130;
+                std::memcpy(dst, o_loc[m][h], kHeadDim * sizeof(float));
+                dst[128] = m_loc[m][h];
+                dst[129] = l_loc[m][h];
+            }
+        }
+    }
+};
+
+}  // namespace
+
+namespace {
+struct PersistentBf16cPool {
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv_go;
+    std::atomic<uint64_t> gen{0};
+    std::atomic<int> done_cnt{0};
+    bool stop = false;
+    int num_workers = 0;
+    HostAttnBf16cPool::Job cur_job{};
+    std::vector<float> scratch;
+
+    PersistentBf16cPool() {
+        int hw = (int)std::thread::hardware_concurrency();
+        int want = std::min(std::max(1, hw), 16);
+        if (const char* e = std::getenv("STRATA_INK_HOST_KV_THREADS")) {
+            int v = std::atoi(e);
+            if (v > 0) want = std::min(v, 32);
+        }
+        num_workers = std::max(0, want - 1);
+        workers.reserve((size_t)num_workers);
+        for (int t = 1; t <= num_workers; ++t) workers.emplace_back([this, t]() { loop(t); });
+    }
+    ~PersistentBf16cPool() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; gen.fetch_add(1, std::memory_order_release); }
+        cv_go.notify_all();
+        for (auto& w : workers) if (w.joinable()) w.join();
+    }
+    void loop(int tid) {
+        uint64_t my_gen = 0;
+        while (true) {
+            uint64_t g = gen.load(std::memory_order_acquire);
+            if (g == my_gen) {
+                for (int sp = 0; sp < 4000; ++sp) { _mm_pause(); g = gen.load(std::memory_order_acquire); if (g != my_gen) break; }
+            }
+            if (g == my_gen) {
+                std::unique_lock<std::mutex> lk(mu);
+                cv_go.wait(lk, [&]() { return stop || gen.load(std::memory_order_acquire) != my_gen; });
+                if (stop) return;
+                g = gen.load(std::memory_order_acquire);
+            }
+            if (stop) return;
+            my_gen = g;
+            if (tid < cur_job.n_thr) HostAttnBf16cPool::run_slice(cur_job, tid);
+            done_cnt.fetch_add(1, std::memory_order_release);
+        }
+    }
+};
+PersistentBf16cPool& bf16c_pool() { static PersistentBf16cPool p; return p; }
+}  // namespace
+
+void ink_host_kv_attn_bf16c(
+    const float* q, const float* rel_table,
+    const void* const* slab_raw_k, const void* const* slab_raw_v,
+    const float* const* slab_raw_ksc, const float* const* slab_raw_vsc,
+    const int32_t* slot_qp, const InkHostKvUniqueBlock* ublocks, int n_ublocks,
+    int M, float* out_buf, int n_threads) {
+    if (M <= 0 || n_ublocks <= 0) return;
+    auto& pool = bf16c_pool();
+    const int avail = pool.num_workers + 1;
+    int want = (n_threads > 0) ? std::min(n_threads, avail) : avail;
+    int n_thr = std::max(1, std::min(want, n_ublocks));
+    const size_t per_thr = (size_t)M * kHeads * 130;
+    if (pool.scratch.size() < (size_t)n_thr * per_thr) pool.scratch.resize((size_t)n_thr * per_thr);
+    auto& scratch = pool.scratch;
+
+    pool.cur_job.q = q; pool.cur_job.rel_table = rel_table;
+    pool.cur_job.slab_k = slab_raw_k; pool.cur_job.slab_v = slab_raw_v;
+    pool.cur_job.slab_ksc = slab_raw_ksc; pool.cur_job.slab_vsc = slab_raw_vsc;
+    pool.cur_job.slot_qp = slot_qp; pool.cur_job.ublocks = ublocks; pool.cur_job.n_ublocks = n_ublocks;
+    pool.cur_job.M = M; pool.cur_job.n_thr = n_thr; pool.cur_job.thr_out = scratch.data();
+
+    if (n_thr > 1 && pool.num_workers > 0) {
+        pool.done_cnt.store(0, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lk(pool.mu); pool.gen.fetch_add(1, std::memory_order_release); }
+        pool.cv_go.notify_all();
+        HostAttnBf16cPool::run_slice(pool.cur_job, 0);
+        while (pool.done_cnt.load(std::memory_order_acquire) < pool.num_workers) _mm_pause();
+    } else {
+        HostAttnBf16cPool::run_slice(pool.cur_job, 0);
+    }
+
+    for (int m = 0; m < M; ++m) {
+        for (int h = 0; h < kHeads; ++h) {
+            const size_t off = ((size_t)m * kHeads + h) * 130;
+            float mg = -1e30f;
+            for (int t = 0; t < n_thr; ++t) {
+                const float* s = scratch.data() + (size_t)t * per_thr + off;
+                if (s[129] > 0.0f && s[128] > mg) mg = s[128];
+            }
+            float* dst = out_buf + off;
+            if (mg <= -1e29f) {
+                std::memset(dst, 0, kHeadDim * sizeof(float));
+                dst[128] = -1e30f; dst[129] = 0.0f;
+                continue;
+            }
+            float lt = 0.0f;
+            std::memset(dst, 0, kHeadDim * sizeof(float));
+            for (int t = 0; t < n_thr; ++t) {
+                const float* s = scratch.data() + (size_t)t * per_thr + off;
+                if (s[129] <= 0.0f) continue;
+                const float w = std::exp(s[128] - mg);
+                lt += s[129] * w;
+                const __m256 vw = _mm256_set1_ps(w);
+                for (int d = 0; d < kHeadDim; d += 8) {
+                    _mm256_storeu_ps(dst + d, _mm256_fmadd_ps(_mm256_loadu_ps(s + d), vw, _mm256_loadu_ps(dst + d)));
+                }
+            }
+            dst[128] = mg; dst[129] = lt;
+        }
+    }
+}
+
+void ink_host_kv_build_summary_bf16c(const void* slab_raw_k, const float* slab_raw_ksc, int boff, int pos_len, InkBlockSummary* out_sum) {
+    if (!slab_raw_k || !slab_raw_ksc || !out_sum || pos_len <= 0) return;
+    const uint8_t* sk = reinterpret_cast<const uint8_t*>(slab_raw_k)
+                      + (size_t)boff * kBlockTok * kKVHeads * kBf16cHeadBytes;
+    const uint32_t* sks = reinterpret_cast<const uint32_t*>(slab_raw_ksc)
+                        + (size_t)boff * kBlockTok * kKVHeads;
+    alignas(32) float vmin[kKVHeads * kHeadDim];
+    alignas(32) float vmax[kKVHeads * kHeadDim];
+    alignas(32) float tmp[kHeadDim];
+    for (int kh = 0; kh < kKVHeads; ++kh) {
+        bf16c_decode128_avx2(sk + (size_t)kh * kBf16cHeadBytes, sks[kh], tmp);
+        std::memcpy(vmin + kh * kHeadDim, tmp, kHeadDim * sizeof(float));
+        std::memcpy(vmax + kh * kHeadDim, tmp, kHeadDim * sizeof(float));
+    }
+    for (int t = 1; t < pos_len; ++t) {
+        const uint8_t* row = sk + (size_t)t * kKVHeads * kBf16cHeadBytes;
+        const uint32_t* rs = sks + (size_t)t * kKVHeads;
+        for (int kh = 0; kh < kKVHeads; ++kh) {
+            bf16c_decode128_avx2(row + (size_t)kh * kBf16cHeadBytes, rs[kh], tmp);
+            float* mn = vmin + kh * kHeadDim;
+            float* mx = vmax + kh * kHeadDim;
+            for (int d = 0; d < kHeadDim; d += 8) {
+                __m256 v = _mm256_load_ps(tmp + d);
+                _mm256_store_ps(mn + d, _mm256_min_ps(_mm256_load_ps(mn + d), v));
+                _mm256_store_ps(mx + d, _mm256_max_ps(_mm256_load_ps(mx + d), v));
+            }
+        }
+    }
+    for (int i = 0; i < kKVHeads * kHeadDim; i += 8) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_sum->k_min + i), _mm256_cvtps_ph(_mm256_load_ps(vmin + i), _MM_FROUND_TO_NEAREST_INT));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_sum->k_max + i), _mm256_cvtps_ph(_mm256_load_ps(vmax + i), _MM_FROUND_TO_NEAREST_INT));
+    }
+    out_sum->valid = 1;
+}
+
+int ink_host_kv_select_topk_bf16c(
+    const float* q, const void* const* slab_raw_k, const float* const* slab_raw_ksc,
+    InkBlockSummary* const* slab_sums, const InkHostKvUniqueBlock* ublocks, int n_ublocks,
+    int M, int top_k, int* out_indices) {
+    if (n_ublocks <= 0 || top_k <= 0) return 0;
+    for (int i = 0; i < n_ublocks; ++i) {
+        const auto& ub = ublocks[i];
+        InkBlockSummary* sm = &slab_sums[ub.slab][ub.boff];
+        if (!sm->valid) ink_host_kv_build_summary_bf16c(slab_raw_k[ub.slab], slab_raw_ksc[ub.slab], ub.boff, ub.max_pos_len, sm);
+    }
+    // Once summaries are populated in FP16, reuse the exact same AVX2 Quest/FreeKV Top-K scorer!
+    return ink_host_kv_select_topk_fp16(q, slab_raw_k, slab_sums, ublocks, n_ublocks, M, top_k, out_indices);
+}
+
+}  // namespace strata::ink
