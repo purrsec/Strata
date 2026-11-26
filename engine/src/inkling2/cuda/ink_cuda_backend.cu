@@ -645,6 +645,10 @@ public:
             dspark_slot_ = -1;
         }
         ckpt_sync();
+        if (runner_->paged_kv_active && seq_len > 0) {
+            const int keep_blks = (seq_len + strata::ink::kInkKvBlock - 1) >> strata::ink::kInkKvBlockShift;
+            runner_->paged_release_slot(slot, keep_blks);
+        }
         return true;
     }
 

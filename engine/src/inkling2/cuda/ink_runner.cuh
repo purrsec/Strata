@@ -1962,6 +1962,8 @@ struct InkCudaRunner {
     std::vector<InkHostKvUniqueBlock> spec_sel_blocks;    // selected Top-K blocks for current visit
     std::vector<float> prev_q_glob[8];                    // saved Q(t-1) per global visit (0..7)
     int  prev_q_M[8]  = {};
+    uint64_t prev_q_sig[8] = {};
+    uint64_t cur_step_sig  = 0;
     bool spec_prefetched_ok = false;
     int  spec_prefetched_cnt = 0;
     uint64_t spec_hits = 0, spec_misses = 0;
@@ -2072,6 +2074,12 @@ struct InkCudaRunner {
         cpu_ublocks.clear();
         gpu_ublocks.clear();
 
+        // Compute slot-set signature so Stage F never speculates with a different slot Q(t-1)!
+        cur_step_sig = (uint64_t)M;
+        for (int mi = 0; mi < M; ++mi) {
+            const int sl = slot_arr ? slot_arr[mi] : slot0;
+            cur_step_sig = cur_step_sig * 1315423911ull ^ (uint64_t)(sl + 1);
+        }
         // Track tail blocks (which k_ink_kv_write mutates during this step -> MUST stay on CPU post-sync, NEVER prefetched!)
         std::vector<uint8_t> is_tail;
         for (int mi = 0; mi < M; ++mi) {
@@ -2347,6 +2355,16 @@ struct InkCudaRunner {
                 }
             }
         };
+        if (dst_phys >= kv_dev_blocks) {
+            const int dhi = dst_phys - kv_dev_blocks;
+            const int dsl = dhi >> kInkSlabShift;
+            const int dbo = dhi & kInkSlabMask;
+            for (int v = 0; v < kInkVisits; ++v) {
+                if (!kv_desc[v].is_swa && dsl < (int)host_slabs[v].size() && dbo < (int)host_slabs[v][dsl].sums.size()) {
+                    host_slabs[v][dsl].sums[dbo].valid = 0;
+                }
+            }
+        }
         for (int v = 0; v < kInkVisits; ++v) {
             if (kv_desc[v].is_swa) continue;
             void *sk, *sv, *dk, *dv;
@@ -4062,7 +4080,7 @@ struct InkCudaRunner {
 
                     // FreeKV Section 3.3: verify cosine similarity between Q(t) and Q(t-1)!
                     bool hit = false;
-                    if (spec_prefetched_ok && g_idx >= 0 && prev_q_M[g_idx] == M && !prev_q_glob[g_idx].empty()) {
+                    if (spec_prefetched_ok && g_idx >= 0 && prev_q_M[g_idx] == M && prev_q_sig[g_idx] == cur_step_sig && !prev_q_glob[g_idx].empty()) {
                         const float gcos = ink_host_kv_min_q_cosine(h_cpu_q_pin, prev_q_glob[g_idx].data(), M);
                         hit = (gcos >= spec_kv_tau);
                     }
@@ -4073,13 +4091,15 @@ struct InkCudaRunner {
                         ++spec_hits;
                     } else {
                         ++spec_misses;
-                        // Correction: re-select Top-K using exact Q(t) (< 0.25 ms) & DMA into `buf` (~1.3 ms)!
+                        // Wait for prior speculative DMA on `buf` before reusing pinned h_tide_meta[buf] (eliminates host/DMA race!)
+                        if (spec_prefetched_ok) INK_CK(cudaEventSynchronize(ev_tide_dma_done[buf]));
                         cnt = spec_select_and_enqueue(g_idx, h_cpu_q_pin, M, buf);
                     }
                     // Save real Q(t) as Q(t-1) for next token
                     if (g_idx >= 0) {
                         prev_q_glob[g_idx].assign(h_cpu_q_pin, h_cpu_q_pin + (size_t)M * kInkHeads * kInkHeadDim);
                         prev_q_M[g_idx] = M;
+                        prev_q_sig[g_idx] = cur_step_sig;
                     }
 
                     // Attend Top-K blocks in VRAM (already arrived if hit!)
@@ -4115,7 +4135,7 @@ struct InkCudaRunner {
                     tide_cur_buf = nbuf;
                     spec_prefetched_ok = false;
                     spec_prefetched_cnt = 0;
-                    if (g_idx >= 0 && g_idx + 1 < 8 && prev_q_M[g_idx + 1] == M && !prev_q_glob[g_idx + 1].empty()) {
+                    if (g_idx >= 0 && g_idx + 1 < 8 && prev_q_M[g_idx + 1] == M && prev_q_sig[g_idx + 1] == cur_step_sig && !prev_q_glob[g_idx + 1].empty()) {
                         spec_prefetched_cnt = spec_select_and_enqueue(g_idx + 1, prev_q_glob[g_idx + 1].data(), M, nbuf);
                         spec_prefetched_ok = (spec_prefetched_cnt > 0);
                     }
@@ -4261,6 +4281,7 @@ struct InkCudaRunner {
                     k_ink_pf_online_init<<<dim3(kInkHeads, M), 128, 0, st>>>(d_sinks, d_pf_m, d_pf_l, d_pf_o, 0, M);
                     const int k_end_all = p0_val + M;
                     const bool pf_dma_ok = paged_kv_active && kv_dtype == InkKvDtype::FP16 && kv_host_slabs > 0 && ensure_tide_streamer();
+                    if (pf_dma_ok) INK_CK(cudaStreamWaitEvent(st, ev_tide_dma_done[0], 0));
                     for (int kt = k_start; kt < k_end_all; kt += kInkPfKvTile) {
                         const int K_t = std::min(kInkPfKvTile, k_end_all - kt);
                         bool used_pf_dma = false;
@@ -4532,7 +4553,7 @@ struct InkCudaRunner {
             tide_cur_buf = 0;
             spec_prefetched_ok = false;
             spec_prefetched_cnt = 0;
-            if (prev_q_M[0] == M && !prev_q_glob[0].empty()) {
+            if (prev_q_M[0] == M && prev_q_sig[0] == cur_step_sig && !prev_q_glob[0].empty()) {
                 // FreeKV/HERALD: speculatively score & prefetch Global Visit 5 using Q(t-1) WHILE GPU runs SWA 0..4!
                 spec_prefetched_cnt = spec_select_and_enqueue(0, prev_q_glob[0].data(), M, 0);
                 spec_prefetched_ok = (spec_prefetched_cnt > 0);
